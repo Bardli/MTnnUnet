@@ -168,31 +168,49 @@ class ResNet_MTL_nnUNet(nn.Module):
             )
 
         # ---------------------------------
-        # 3. 构建分类头 (Cls Head)
+        # 3. ★★★ 构建新的聚合分类头 (Cls Head) ★★★
         # ---------------------------------
-        bottleneck_embed_dim = features_per_stage[-1]
         
-        self.classification_head = ClassificationHead(
-            embed_dim=bottleneck_embed_dim,
-            query_num=cls_query_num,
-            num_classes=cls_num_classes, # 使用修正后位置的参数
-            dropout=cls_dropout,
-            use_cross_attention=use_cross_attention,
-            num_heads=cls_num_heads
+        # 瓶颈层的特征数
+        bottleneck_features_dim = features_per_stage[-1]
+        
+        # 解码器每个阶段输出的特征数
+        # (s-1) 对应 s = n_stages-1 到 1, 即 features_per_stage[n_stages-2] 到 features_per_stage[0]
+        decoder_features_dims = [features_per_stage[s-1] for s in range(n_stages - 1, 0, -1)]
+        
+        # 总特征维度 = 瓶颈层 + 所有解码器层
+        # 例如 (320) + (320, 256, 128, 64, 32)
+        total_cls_input_dim = bottleneck_features_dim + sum(decoder_features_dims)
+        
+        # 验证：对于 (32, 64, 128, 256, 320, 320), 
+        # total_dim = 320 + (320 + 256 + 128 + 64 + 32) = 1120.
+        # 这等于 sum(features_per_stage)
+        # assert total_cls_input_dim == sum(features_per_stage)
+
+        self.classification_head = nn.Sequential(
+            nn.Linear(total_cls_input_dim, total_cls_input_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(cls_dropout),
+            nn.Linear(total_cls_input_dim // 2, cls_num_classes)
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[Union[torch.Tensor, List[torch.Tensor]], torch.Tensor]:
         
-        # 1. 编码器
+        # 1. 编码器 (保持不变)
         skips = []
         x_enc = x
         for block in self.conv_encoder_blocks:
             x_enc = block(x_enc)
             skips.append(x_enc)
             
-        # 2. 分类头
+        # ---------------------------------
+        # 2. ★★★ 聚合特征用于分类 ★★★
+        # ---------------------------------
+        cls_feature_list = []
+        
+        # (a) 获取瓶颈层特征
         bottleneck_features = skips[-1]
-        class_output = self.classification_head(bottleneck_features)
+        cls_feature_list.append(bottleneck_features)
 
         # 3. 分割解码器
         seg_outputs = []
@@ -203,9 +221,30 @@ class ResNet_MTL_nnUNet(nn.Module):
             x_dec = self.transpconvs[i](x_dec)
             x_dec = torch.cat((x_dec, skip_connection), dim=1)
             x_dec = self.decoder_blocks[i](x_dec)
+            
+            # (b) 获取当前解码器阶段的特征
+            cls_feature_list.append(x_dec)
+            
+            # (c) 计算分割输出 (不变)
             seg_outputs.append(self.seg_layers[i](x_dec))
 
-        # 4. 格式化输出
+        # ---------------------------------
+        # 4. ★★★ 完成分类头的计算 ★★★
+        # ---------------------------------
+        
+        # (d) 对每个尺度的特征图进行全局平均池化
+        #     - f.shape 可能是 [B, C, D, H, W]
+        #     - .mean(-1).mean(-1).mean(-1) 是一个高效的全局池化
+        pooled_features = [f.mean(dim=[-1, -2, -3]) for f in cls_feature_list]
+        
+        # (e) 拼接所有尺度的特征向量
+        #     - pooled_features 是一个列表, 包含 [B, 320], [B, 320], [B, 256], ...
+        combined_vector = torch.cat(pooled_features, dim=1)
+        
+        # (f) 得到最终分类输出
+        class_output = self.classification_head(combined_vector)
+        
+        # 5. 格式化分割输出 (保持不变)
         if self.deep_supervision:
             seg_output_return = seg_outputs[::-1] 
         else:

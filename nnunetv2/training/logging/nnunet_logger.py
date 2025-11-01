@@ -23,7 +23,13 @@ class nnUNetLogger(object):
             'val_losses': list(),
             'lrs': list(),
             'epoch_start_timestamps': list(),
-            'epoch_end_timestamps': list()
+            'epoch_end_timestamps': list(),
+            'train_loss_seg': list(),
+            'train_loss_cls': list(),
+            'val_loss_seg': list(),
+            'val_loss_cls': list(),
+            'val_macro_f1': list(),
+            'val_accuracy': list()
         }
         self.verbose = verbose
         # shut up, this logging is great

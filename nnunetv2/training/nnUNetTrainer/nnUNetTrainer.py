@@ -184,7 +184,7 @@ class nnUNetTrainer(object):
 
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
-
+        self.tr_keys = self.val_keys = None # for cls imbalence place holder
         ### initializing stuff for remembering things and such
         self._best_ema = None
 
@@ -239,7 +239,7 @@ class nnUNetTrainer(object):
             self.cls_loss = torch.nn.CrossEntropyLoss() # 或者 BCEWithLogitsLoss 等
             # new segmentation loss
             self.lambda_seg = 1.0 # 分割损失的权重
-            self.lambda_cls = 0.5 # 分类损失的权重 (示例)
+            self.lambda_cls = 2.0 # 分类损失的权重 (示例)
 
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
@@ -661,6 +661,8 @@ class nnUNetTrainer(object):
     def get_tr_and_val_datasets(self):
         # create dataset split
         tr_keys, val_keys = self.do_split()
+        self.tr_keys = tr_keys
+        self.val_keys = val_keys
 
         # load the datasets for training and validation. Note that we always draw random samples so we really don't
         # care about distributing training cases across GPUs.
@@ -949,6 +951,66 @@ class nnUNetTrainer(object):
         # which may not be present  when doing inference
         self.dataloader_train, self.dataloader_val = self.get_dataloaders()
 
+        # -----------------------------------------------------------------
+        # ★★★ START: 插入解决类别不平衡的代码 (已修复) ★★★
+        # -----------------------------------------------------------------
+        self.print_to_log_file("Calculating class weights for imbalanced classification task...")
+        
+        # 1. (修复) 正确访问 nnUNetDataset
+        #    路径是: NonDetMultiThreadedAugmenter -> nnUNetDataLoader -> nnUNetDataset
+        if self.tr_keys is None:
+             raise RuntimeError("self.tr_keys was not set in get_tr_and_val_datasets. This should not happen.")
+        tr_keys = self.tr_keys
+        
+        # 2. 解析 'keys' 以获取标签 (假设格式为 'quiz_LABEL_...')
+        try:
+            # 假设标签是整数 (0, 1, 2, ...)
+            tr_labels = [int(k.split('_')[1]) for k in tr_keys]
+        except Exception as e:
+            self.print_to_log_file(f"!!! WARNING: Could not parse labels from training keys for weighted loss.")
+            self.print_to_log_file(f"!!! Make sure filenames follow the 'quiz_LABEL_...' format.")
+            self.print_to_log_file(f"!!! Using UNWEIGHTED classification loss. Error: {e}")
+            tr_labels = None
+
+        if tr_labels is not None:
+            # 3. 获取分类头的类别总数
+            if self.is_ddp:
+                net = self.network.module
+            else:
+                net = self.network
+            
+            try:
+                # 假设你的MLP是 nn.Sequential(..., nn.Linear(in, out))
+                num_classes = net.classification_head[-1].out_features
+            except Exception as e:
+                self.print_to_log_file(f"!!! WARNING: Could not determine num_classes from network: {e}")
+                self.print_to_log_file("!!! Using UNWEIGHTED classification loss.")
+                num_classes = None
+
+            if num_classes is not None:
+                # 4. 统计每个类别的样本数
+                counts = np.bincount(tr_labels, minlength=num_classes)
+                
+                if np.any(counts == 0):
+                    self.print_to_log_file(f"!!! WARNING: Classes {np.where(counts==0)[0]} have 0 samples in this training fold.")
+                    self.print_to_log_file("!!! Using UNWEIGHTED classification loss to avoid division by zero.")
+                else:
+                    # 5. 计算权重
+                    n_samples = len(tr_labels)
+                    weights = n_samples / (num_classes * counts)
+                    
+                    # 6. 将权重转换为张量并移动到GPU
+                    class_weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
+                    
+                    # 7. ★★★ 覆盖 (Overwrite) 原有的损失函数 ★★★
+                    self.cls_loss = torch.nn.CrossEntropyLoss(weight=class_weights)
+                    self.print_to_log_file(f"Successfully applied weighted CrossEntropyLoss.")
+                    self.print_to_log_file(f"Class counts (this fold): {counts}")
+                    self.print_to_log_file(f"Class weights (this fold): {weights}")
+
+        # -----------------------------------------------------------------
+        # ★★★ END: 插入的代码结束 ★★★
+        # -----------------------------------------------------------------
         maybe_mkdir_p(self.output_folder)
 
         # make sure deep supervision is on in the network
