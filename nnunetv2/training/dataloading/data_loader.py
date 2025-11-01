@@ -164,13 +164,78 @@ class nnUNetDataLoader(DataLoader):
 
         return bbox_lbs, bbox_ubs
 
+    # def generate_train_batch(self):
+    #     selected_keys = self.get_indices()
+    #     # preallocate memory for data and seg
+    #     data_all = np.zeros(self.data_shape, dtype=np.float32)
+    #     seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+
+    #     for j, i in enumerate(selected_keys):
+    #         # oversampling foreground will improve stability of model training, especially if many patches are empty
+    #         # (Lung for example)
+    #         force_fg = self.get_do_oversample(j)
+
+    #         data, seg, seg_prev, properties = self._data.load_case(i)
+
+    #         # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
+    #         # self._data.load_case(i) (see nnUNetDataset.load_case)
+    #         shape = data.shape[1:]
+
+    #         bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+    #         bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
+
+    #         # use ACVL utils for that. Cleaner.
+    #         data_all[j] = crop_and_pad_nd(data, bbox, 0)
+
+    #         seg_cropped = crop_and_pad_nd(seg, bbox, -1)
+    #         if seg_prev is not None:
+    #             seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
+    #         seg_all[j] = seg_cropped
+
+    #     if self.patch_size_was_2d:
+    #         data_all = data_all[:, :, 0]
+    #         seg_all = seg_all[:, :, 0]
+
+    #     if self.transforms is not None:
+    #         with torch.no_grad():
+    #             with threadpool_limits(limits=1, user_api=None):
+    #                 data_all = torch.from_numpy(data_all).float()
+    #                 seg_all = torch.from_numpy(seg_all).to(torch.int16)
+    #                 images = []
+    #                 segs = []
+    #                 for b in range(self.batch_size):
+    #                     tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+    #                     images.append(tmp['image'])
+    #                     segs.append(tmp['segmentation'])
+    #                 data_all = torch.stack(images)
+    #                 if isinstance(segs[0], list):
+    #                     seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
+    #                 else:
+    #                     seg_all = torch.stack(segs)
+    #                 del segs, images
+    #         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+
+    #     return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+
     def generate_train_batch(self):
         selected_keys = self.get_indices()
         # preallocate memory for data and seg
         data_all = np.zeros(self.data_shape, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+        # MODIFICATION: Preallocate memory for the classification labels for the batch.
+        class_labels_all = np.zeros(self.batch_size, dtype=np.int64)
 
         for j, i in enumerate(selected_keys):
+            # MODIFICATION: Extract the class label from the case identifier string 'i'.
+            # This assumes the format 'quiz_LABEL_...' where LABEL is an integer.
+            try:
+                class_label = int(i.split('_')[1])
+                class_labels_all[j] = class_label
+            except (IndexError, ValueError):
+                # This error handling is crucial in case a file has an unexpected name format.
+                raise RuntimeError(f"Failed to parse class label from case identifier: '{i}'. "
+                                f"Expected format 'quiz_LABEL_CASEID'.")
+
             # oversampling foreground will improve stability of model training, especially if many patches are empty
             # (Lung for example)
             force_fg = self.get_do_oversample(j)
@@ -201,6 +266,9 @@ class nnUNetDataLoader(DataLoader):
                 with threadpool_limits(limits=1, user_api=None):
                     data_all = torch.from_numpy(data_all).float()
                     seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    # MODIFICATION: Convert the numpy array of class labels to a torch tensor for consistency.
+                    class_labels_all = torch.from_numpy(class_labels_all).long()
+                    
                     images = []
                     segs = []
                     for b in range(self.batch_size):
@@ -208,14 +276,16 @@ class nnUNetDataLoader(DataLoader):
                         images.append(tmp['image'])
                         segs.append(tmp['segmentation'])
                     data_all = torch.stack(images)
-                    if isinstance(segs[0], list):
-                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
+                    if isinstance(segs, list):
+                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs))]
                     else:
                         seg_all = torch.stack(segs)
                     del segs, images
-            return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+                    # MODIFICATION: Add the batch of class labels to the returned dictionary.
+                    return {'data': data_all, 'target': seg_all, 'class_label': class_labels_all, 'keys': selected_keys}
 
-        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+        # MODIFICATION: Add the batch of class labels to the returned dictionary for the non-transform case.
+        return {'data': data_all, 'target': seg_all, 'class_label': class_labels_all, 'keys': selected_keys}    
 
 
 if __name__ == '__main__':

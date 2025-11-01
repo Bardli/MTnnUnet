@@ -66,6 +66,12 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
+# import my model
+from nnunetv2.training.nnUNetTrainer.variants.network_architecture.ResNet_MTL_nnUNet import ResNet_MTL_nnUNet
+
+# compute validation score
+from sklearn.metrics import f1_score, accuracy_score
+import numpy as np
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -148,7 +154,7 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 100
         self.current_epoch = 0
         self.enable_deep_supervision = True
 
@@ -162,7 +168,10 @@ class nnUNetTrainer(object):
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
         self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
-
+        # 假设在 initialize() 中
+        self.lambda_seg = 0 # 分割损失的权重
+        self.lambda_cls = 0 # 分类损失的权重 (示例)
+        self.cls_loss = None
         ### Simple logging. Don't take that away from me!
         # initialize log file. This is just our log for the print statements etc. Not to be confused with lightning
         # logging
@@ -225,7 +234,12 @@ class nnUNetTrainer(object):
                 self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
                 self.network = DDP(self.network, device_ids=[self.local_rank])
 
-            self.loss = self._build_loss()
+            self.seg_loss = self._build_loss()
+            # new classification loss
+            self.cls_loss = torch.nn.CrossEntropyLoss() # 或者 BCEWithLogitsLoss 等
+            # new segmentation loss
+            self.lambda_seg = 1.0 # 分割损失的权重
+            self.lambda_cls = 0.5 # 分类损失的权重 (示例)
 
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
@@ -300,40 +314,76 @@ class nnUNetTrainer(object):
             dct['cudnn_version'] = cudnn_version
             save_json(dct, join(self.output_folder, "debug.json"))
 
+    # @staticmethod
+    # def build_network_architecture(architecture_class_name: str,
+    #                                arch_init_kwargs: dict,
+    #                                arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+    #                                num_input_channels: int,
+    #                                num_output_channels: int,
+    #                                enable_deep_supervision: bool = True) -> nn.Module:
+    #     """
+    #     This is where you build the architecture according to the plans. There is no obligation to use
+    #     get_network_from_plans, this is just a utility we use for the nnU-Net default architectures. You can do what
+    #     you want. Even ignore the plans and just return something static (as long as it can process the requested
+    #     patch size)
+    #     but don't bug us with your bugs arising from fiddling with this :-P
+    #     This is the function that is called in inference as well! This is needed so that all network architecture
+    #     variants can be loaded at inference time (inference will use the same nnUNetTrainer that was used for
+    #     training, so if you change the network architecture during training by deriving a new trainer class then
+    #     inference will know about it).
+
+    #     If you need to know how many segmentation outputs your custom architecture needs to have, use the following snippet:
+    #     > label_manager = plans_manager.get_label_manager(dataset_json)
+    #     > label_manager.num_segmentation_heads
+    #     (why so complicated? -> We can have either classical training (classes) or regions. If we have regions,
+    #     the number of outputs is != the number of classes. Also there is the ignore label for which no output
+    #     should be generated. label_manager takes care of all that for you.)
+
+    #     """
+    #     return get_network_from_plans(
+    #         architecture_class_name,
+    #         arch_init_kwargs,
+    #         arch_init_kwargs_req_import,
+    #         num_input_channels,
+    #         num_output_channels,
+    #         allow_init=True,
+    #         deep_supervision=enable_deep_supervision)
+
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
-                                   arch_init_kwargs: dict,
-                                   arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
-                                   num_input_channels: int,
-                                   num_output_channels: int,
-                                   enable_deep_supervision: bool = True) -> nn.Module:
+                                     arch_init_kwargs: dict,
+                                     arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+                                     num_input_channels: int,
+                                     num_output_channels: int,  # 这是分割头的通道数
+                                     enable_deep_supervision: bool = True) -> nn.Module:
         """
-        This is where you build the architecture according to the plans. There is no obligation to use
-        get_network_from_plans, this is just a utility we use for the nnU-Net default architectures. You can do what
-        you want. Even ignore the plans and just return something static (as long as it can process the requested
-        patch size)
-        but don't bug us with your bugs arising from fiddling with this :-P
-        This is the function that is called in inference as well! This is needed so that all network architecture
-        variants can be loaded at inference time (inference will use the same nnUNetTrainer that was used for
-        training, so if you change the network architecture during training by deriving a new trainer class then
-        inference will know about it).
-
-        If you need to know how many segmentation outputs your custom architecture needs to have, use the following snippet:
-        > label_manager = plans_manager.get_label_manager(dataset_json)
-        > label_manager.num_segmentation_heads
-        (why so complicated? -> We can have either classical training (classes) or regions. If we have regions,
-        the number of outputs is != the number of classes. Also there is the ignore label for which no output
-        should be generated. label_manager takes care of all that for you.)
-
+        此方法被重写，以直接加载自定义的 ResNet_MTL_nnUNet 模型，
+        模仿 nnXNetTrainer 的方式。
         """
-        return get_network_from_plans(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            num_output_channels,
-            allow_init=True,
-            deep_supervision=enable_deep_supervision)
+        import pydoc  # 像范例中一样，在这里导入 pydoc
+
+        # 1. 复制从 plans 文件加载的架构参数
+        architecture_kwargs = dict(**arch_init_kwargs)
+
+        # 2. 将字符串 (例如 'nn.InstanceNorm3d') 转换为类
+        for ri in arch_init_kwargs_req_import:
+            if architecture_kwargs[ri] is not None:
+                architecture_kwargs[ri] = pydoc.locate(architecture_kwargs[ri])
+
+        # 3. 直接实例化你的自定义模型
+        # 注意：
+        # - `num_output_channels` 被传递给 `num_classes` (分割头)
+        # - `cls_num_classes` 预计存在于 `architecture_kwargs` 中 (从 plans.json 加载)
+        network = ResNet_MTL_nnUNet(
+            input_channels=num_input_channels,
+            num_classes=num_output_channels,  # 分割头的类别数
+            deep_supervision=enable_deep_supervision,
+            cls_num_classes=3,
+            **architecture_kwargs  # 解包所有来自 plans 文件的参数
+                                     # (例如 n_stages, features_per_stage, block, cls_num_classes 等)
+        )
+
+        return network
 
     def _get_deep_supervision_scales(self):
         if self.enable_deep_supervision:
@@ -889,7 +939,7 @@ class nnUNetTrainer(object):
         if isinstance(mod, OptimizedModule):
             mod = mod._orig_mod
 
-        mod.decoder.deep_supervision = enabled
+        mod.deep_supervision = enabled
 
     def on_train_start(self):
         if not self.was_initialized:
@@ -970,15 +1020,49 @@ class nnUNetTrainer(object):
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
 
+    # def train_step(self, batch: dict) -> dict:
+    #     data = batch['data']
+    #     target = batch['target']
+
+    #     data = data.to(self.device, non_blocking=True)
+    #     if isinstance(target, list):
+    #         target = [i.to(self.device, non_blocking=True) for i in target]
+    #     else:
+    #         target = target.to(self.device, non_blocking=True)
+
+    #     self.optimizer.zero_grad(set_to_none=True)
+    #     # Autocast can be annoying
+    #     # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
+    #     # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+    #     # So autocast will only be active if we have a cuda device.
+    #     with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+    #         output = self.network(data)
+    #         # del data
+    #         l = self.loss(output, target)
+
+    #     if self.grad_scaler is not None:
+    #         self.grad_scaler.scale(l).backward()
+    #         self.grad_scaler.unscale_(self.optimizer)
+    #         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+    #         self.grad_scaler.step(self.optimizer)
+    #         self.grad_scaler.update()
+    #     else:
+    #         l.backward()
+    #         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+    #         self.optimizer.step()
+    #     return {'loss': l.detach().cpu().numpy()}
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
-        target = batch['target']
+        target_seg = batch['target']
+        target_cls = batch['class_label']
 
         data = data.to(self.device, non_blocking=True)
-        if isinstance(target, list):
-            target = [i.to(self.device, non_blocking=True) for i in target]
+        target_cls = target_cls.to(self.device, non_blocking=True)
+
+        if isinstance(target_seg, list):
+            target_seg = [i.to(self.device, non_blocking=True) for i in target_seg]
         else:
-            target = target.to(self.device, non_blocking=True)
+            target_seg = target_seg.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
         # Autocast can be annoying
@@ -986,9 +1070,21 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data)
-            # del data
-            l = self.loss(output, target)
+            #Assume the network returns a tuple of (segmentation_output, classification_output)
+            output_seg, output_cls = self.network(data)
+
+            # --- 3. 修改：计算加权组合损失 ---
+            # 假设您在 initialize() 中定义了 self.seg_loss, self.cls_loss, 
+            # 以及 self.lambda_seg, self.lambda_cls
+
+            # (a) 计算分割损失 (与之前相同)
+            l_seg = self.seg_loss(output_seg, target_seg)
+
+            # (b) 计算分类损失
+            l_cls = self.cls_loss(output_cls, target_cls)
+
+            # (c) 计算加权总损失
+            l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1000,8 +1096,12 @@ class nnUNetTrainer(object):
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-        return {'loss': l.detach().cpu().numpy()}
-
+        return {
+                'loss': l.detach().cpu().numpy(),         # 总损失
+                'loss_seg': l_seg.detach().cpu().numpy(), # 仅分割损失
+                'loss_cls': l_cls.detach().cpu().numpy()  # 仅分类损失
+               }
+    
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
 
@@ -1009,83 +1109,121 @@ class nnUNetTrainer(object):
             losses_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(losses_tr, outputs['loss'])
             loss_here = np.vstack(losses_tr).mean()
+            
+            # --- GAI: 收集 seg 和 cls 训练损失 ---
+            losses_seg_tr = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(losses_seg_tr, outputs['loss_seg'])
+            loss_seg_here = np.vstack(losses_seg_tr).mean()
+
+            losses_cls_tr = [None for _ in range(dist.get_world_size())]
+            dist.all_gather_object(losses_cls_tr, outputs['loss_cls'])
+            loss_cls_here = np.vstack(losses_cls_tr).mean()
+            # --- GAI END ---
         else:
             loss_here = np.mean(outputs['loss'])
+            # --- GAI: 收集 seg 和 cls 训练损失 ---
+            loss_seg_here = np.mean(outputs['loss_seg'])
+            loss_cls_here = np.mean(outputs['loss_cls'])
+            # --- GAI END ---
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
+        # --- GAI: 记录 seg 和 cls 训练损失 ---
+        self.logger.log('train_loss_seg', loss_seg_here, self.current_epoch)
+        self.logger.log('train_loss_cls', loss_cls_here, self.current_epoch)
+        
 
     def on_validation_epoch_start(self):
         self.network.eval()
 
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
-        target = batch['target']
+        # 1. 修改：获取分割和分类的目标
+        target_seg = batch['target']
+        target_cls = batch['class_label']
 
         data = data.to(self.device, non_blocking=True)
-        if isinstance(target, list):
-            target = [i.to(self.device, non_blocking=True) for i in target]
+        # 2. 修改：移动两个目标到设备
+        target_cls = target_cls.to(self.device, non_blocking=True)
+        if isinstance(target_seg, list):
+            target_seg = [i.to(self.device, non_blocking=True) for i in target_seg]
         else:
-            target = target.to(self.device, non_blocking=True)
+            target_seg = target_seg.to(self.device, non_blocking=True)
 
-        # Autocast can be annoying
-        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
-        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
-        # So autocast will only be active if we have a cuda device.
+        # Autocast... (保持不变)
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data)
+            # 3. 修改：获取两个网络输出
+            output_seg, output_cls = self.network(data)
             del data
-            l = self.loss(output, target)
+            
+            # 4. 修改：计算多任务损失
+            l_seg = self.seg_loss(output_seg, target_seg)
+            l_cls = self.cls_loss(output_cls, target_cls)
+            l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
 
-        # we only need the output with the highest output resolution (if DS enabled)
+        # --- 以下是分割指标计算 (使用 output_seg 和 target_seg) ---
+
+        # 5. 修改：对分割输出应用深度监督逻辑
         if self.enable_deep_supervision:
-            output = output[0]
-            target = target[0]
+            output_seg = output_seg[0]
+            target_seg = target_seg[0]
 
-        # the following is needed for online evaluation. Fake dice (green line)
-        axes = [0] + list(range(2, output.ndim))
+        # 6. 修改：使用分割输出计算 axes
+        axes = [0] + list(range(2, output_seg.ndim))
 
+        # 7. 修改：使用分割输出计算 one-hot 预测
         if self.label_manager.has_regions:
-            predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
+            predicted_segmentation_onehot = (torch.sigmoid(output_seg) > 0.5).long()
         else:
             # no need for softmax
-            output_seg = output.argmax(1)[:, None]
-            predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
-            predicted_segmentation_onehot.scatter_(1, output_seg, 1)
-            del output_seg
+            output_seg_argmax = output_seg.argmax(1)[:, None]
+            predicted_segmentation_onehot = torch.zeros(output_seg.shape, device=output_seg.device, dtype=torch.float32)
+            predicted_segmentation_onehot.scatter_(1, output_seg_argmax, 1)
+            del output_seg_argmax
 
+        # 8. 修改：使用分割目标处理 ignore label
         if self.label_manager.has_ignore_label:
             if not self.label_manager.has_regions:
-                mask = (target != self.label_manager.ignore_label).float()
+                mask = (target_seg != self.label_manager.ignore_label).float()
                 # CAREFUL that you don't rely on target after this line!
-                target[target == self.label_manager.ignore_label] = 0
+                target_seg[target_seg == self.label_manager.ignore_label] = 0
             else:
-                if target.dtype == torch.bool:
-                    mask = ~target[:, -1:]
+                if target_seg.dtype == torch.bool:
+                    mask = ~target_seg[:, -1:]
                 else:
-                    mask = 1 - target[:, -1:]
+                    mask = 1 - target_seg[:, -1:]
                 # CAREFUL that you don't rely on target after this line!
-                target = target[:, :-1]
+                target_seg = target_seg[:, :-1]
         else:
             mask = None
 
-        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
+        # 9. 修改：使用分割目标计算 tp, fp, fn
+        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target_seg, axes=axes, mask=mask)
 
         tp_hard = tp.detach().cpu().numpy()
         fp_hard = fp.detach().cpu().numpy()
         fn_hard = fn.detach().cpu().numpy()
         if not self.label_manager.has_regions:
-            # if we train with regions all segmentation heads predict some kind of foreground. In conventional
-            # (softmax training) there needs tobe one output for the background. We are not interested in the
-            # background Dice
-            # [1:] in order to remove background
+            # ... (原始逻辑保持不变)
             tp_hard = tp_hard[1:]
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        # 10. 修改：返回包含所有指标的字典
+        return {
+            'loss': l.detach().cpu().numpy(),           # 总损失
+            'loss_seg': l_seg.detach().cpu().numpy(),   # 分割损失 (用于日志)
+            'loss_cls': l_cls.detach().cpu().numpy(),   # 分类损失 (用于日志)
+            'tp_hard': tp_hard,                       # 分割指标
+            'fp_hard': fp_hard,
+            'fn_hard': fn_hard,
+            'cls_pred': output_cls.detach().cpu().numpy(), # 分类预测 (用于 AUC/Acc)
+            'cls_target': target_cls.detach().cpu().numpy() # 分类目标 (用于 AUC/Acc)
+        }
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
+        
+        # --- 1. 收集分割指标 (TP, FP, FN) ---
         tp = np.sum(outputs_collated['tp_hard'], 0)
         fp = np.sum(outputs_collated['fp_hard'], 0)
         fn = np.sum(outputs_collated['fn_hard'], 0)
@@ -1093,29 +1231,77 @@ class nnUNetTrainer(object):
         if self.is_ddp:
             world_size = dist.get_world_size()
 
+            # 收集 TPs
             tps = [None for _ in range(world_size)]
             dist.all_gather_object(tps, tp)
             tp = np.vstack([i[None] for i in tps]).sum(0)
 
+            # 收集 FPs
             fps = [None for _ in range(world_size)]
             dist.all_gather_object(fps, fp)
             fp = np.vstack([i[None] for i in fps]).sum(0)
 
+            # 收集 FNs
             fns = [None for _ in range(world_size)]
             dist.all_gather_object(fns, fn)
             fn = np.vstack([i[None] for i in fns]).sum(0)
 
+            # --- 2. GAI: 收集所有损失 ---
             losses_val = [None for _ in range(world_size)]
             dist.all_gather_object(losses_val, outputs_collated['loss'])
             loss_here = np.vstack(losses_val).mean()
-        else:
-            loss_here = np.mean(outputs_collated['loss'])
 
-        global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
+            losses_seg_val = [None for _ in range(world_size)]
+            dist.all_gather_object(losses_seg_val, outputs_collated['loss_seg'])
+            loss_seg_here = np.vstack(losses_seg_val).mean()
+
+            losses_cls_val = [None for _ in range(world_size)]
+            dist.all_gather_object(losses_cls_val, outputs_collated['loss_cls'])
+            loss_cls_here = np.vstack(losses_cls_val).mean()
+
+            # --- 3. GAI: 收集分类结果 ---
+            cls_preds_all = [None for _ in range(world_size)]
+            dist.all_gather_object(cls_preds_all, outputs_collated['cls_pred'])
+            # 预测值 (logits 或 probs)
+            cls_preds = np.concatenate([item for sublist in cls_preds_all for item in sublist])
+
+            cls_targets_all = [None for _ in range(world_size)]
+            dist.all_gather_object(cls_targets_all, outputs_collated['cls_target'])
+            # 真实标签 (整数)
+            cls_targets = np.concatenate([item for sublist in cls_targets_all for item in sublist])
+
+        else:
+            # --- 2. GAI: 收集所有损失 (non-DDP) ---
+            loss_here = np.mean(outputs_collated['loss'])
+            loss_seg_here = np.mean(outputs_collated['loss_seg'])
+            loss_cls_here = np.mean(outputs_collated['loss_cls'])
+
+            # --- 3. GAI: 收集分类结果 (non-DDP) ---
+            cls_preds = np.concatenate(outputs_collated['cls_pred'])
+            cls_targets = np.concatenate(outputs_collated['cls_target'])
+
+        # --- 4. GAI: 计算分割指标 ---
+        # 防止除以零
+        global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) if (2 * i + j + k) > 0 else 0 for i, j, k in zip(tp, fp, fn)]]
         mean_fg_dice = np.nanmean(global_dc_per_class)
+        
+        # --- 5. GAI: 计算分类指标 ---
+        # 假设 cls_preds 是 logits/probs，我们需要 argmax 来获取预测类别
+        cls_preds_int = np.argmax(cls_preds, axis=1)
+        
+        # 计算 Macro F1-Score
+        macro_f1 = f1_score(cls_targets, cls_preds_int, average='macro', zero_division=0)
+        # 计算 Accuracy
+        accuracy = accuracy_score(cls_targets, cls_preds_int)
+
+        # --- 6. GAI: 记录所有指标 ---
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
+        self.logger.log('val_loss_seg', loss_seg_here, self.current_epoch)
+        self.logger.log('val_loss_cls', loss_cls_here, self.current_epoch)
+        self.logger.log('val_macro_f1', macro_f1, self.current_epoch)
+        self.logger.log('val_accuracy', accuracy, self.current_epoch)
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
@@ -1123,10 +1309,39 @@ class nnUNetTrainer(object):
     def on_epoch_end(self):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
-        self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
-        self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
-        self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
-                                               self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
+        # --- GAI: 打印所有训练和验证损失 ---
+        self.print_to_log_file('train_loss (total)', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
+        self.print_to_log_file('train_loss (seg)', np.round(self.logger.my_fantastic_logging['train_loss_seg'][-1], decimals=4))
+        self.print_to_log_file('train_loss (cls)', np.round(self.logger.my_fantastic_logging['train_loss_cls'][-1], decimals=4))
+        
+        self.print_to_log_file('val_loss (total)', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file('val_loss (seg)', np.round(self.logger.my_fantastic_logging['val_loss_seg'][-1], decimals=4))
+        self.print_to_log_file('val_loss (cls)', np.round(self.logger.my_fantastic_logging['val_loss_cls'][-1], decimals=4))
+
+        # --- GAI: 打印你关心的特定分割指标 ---
+        dice_scores = self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]
+        self.print_to_log_file('Pseudo dice (per class)', [np.round(i, decimals=4) for i in dice_scores])
+        
+        # 假设 Label 1 = 胰腺, Label 2 = 病灶 (基于 nnU-Net 标签从 1 开始)
+        # `dice_scores` 数组索引 0 对应 Label 1, 索引 1 对应 Label 2
+        
+        # 计算 Whole Pancreas (Label 1 + Label 2)
+        # 注意：这需要修改 validation_step 来计算合并标签的 TP/FP/FN。
+        # 目前，我们只能打印单类的指标。
+        # (打印单类指标)
+        if len(dice_scores) > 0:
+            self.print_to_log_file(f'  -> Pancreas (Label 1) Dice: {np.round(dice_scores[0], decimals=4)}')
+        if len(dice_scores) > 1:
+            self.print_to_log_file(f'  -> Lesion (Label 2) Dice: {np.round(dice_scores[1], decimals=4)}')
+        
+        # 打印 Mean Foreground Dice
+        self.print_to_log_file('Mean Foreground Dice', np.round(self.logger.my_fantastic_logging['mean_fg_dice'][-1], decimals=4))
+
+        # --- GAI: 打印分类指标 ---
+        self.print_to_log_file('val_accuracy', np.round(self.logger.my_fantastic_logging['val_accuracy'][-1], decimals=4))
+        self.print_to_log_file('val_macro_f1', np.round(self.logger.my_fantastic_logging['val_macro_f1'][-1], decimals=4))
+        # --- GAI END ---
+
         self.print_to_log_file(
             f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
 
@@ -1136,9 +1351,11 @@ class nnUNetTrainer(object):
             self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
 
         # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
-        if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
-            self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
-            self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
+        # GAI: 我们现在使用 'mean_fg_dice' 来判断最佳模型，而不是 ema_fg_dice
+        current_best = self.logger.my_fantastic_logging['mean_fg_dice'][-1]
+        if self._best_ema is None or current_best > self._best_ema:
+            self._best_ema = current_best
+            self.print_to_log_file(f"Yayy! New best Mean pseudo Dice: {np.round(self._best_ema, decimals=4)}")
             self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
 
         if self.local_rank == 0:
@@ -1224,8 +1441,8 @@ class nnUNetTrainer(object):
                                    "This is exactly what we need in perform_actual_validation")
 
         predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
-                                    perform_everything_on_device=True, device=self.device, verbose=False,
-                                    verbose_preprocessing=False, allow_tqdm=False)
+                                        perform_everything_on_device=True, device=self.device, verbose=False,
+                                        verbose_preprocessing=False, allow_tqdm=False)
         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
                                         self.dataset_json, self.__class__.__name__,
                                         self.inference_allowed_mirroring_axes)
@@ -1235,15 +1452,10 @@ class nnUNetTrainer(object):
             validation_output_folder = join(self.output_folder, 'validation')
             maybe_mkdir_p(validation_output_folder)
 
-            # we cannot use self.get_tr_and_val_datasets() here because we might be DDP and then we have to distribute
-            # the validation keys across the workers.
             _, val_keys = self.do_split()
             if self.is_ddp:
                 last_barrier_at_idx = len(val_keys) // dist.get_world_size() - 1
-
                 val_keys = val_keys[self.local_rank:: dist.get_world_size()]
-                # we cannot just have barriers all over the place because the number of keys each GPU receives can be
-                # different
 
             dataset_val = self.dataset_class(self.preprocessed_dataset_folder, val_keys,
                                              folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
@@ -1254,6 +1466,10 @@ class nnUNetTrainer(object):
                 _ = [maybe_mkdir_p(join(self.output_folder_base, 'predicted_next_stage', n)) for n in next_stages]
 
             results = []
+            
+            # --- GAI: 为分类结果创建一个字典 ---
+            all_classification_results = {}
+            # --- GAI END ---
 
             for i, k in enumerate(dataset_val.identifiers):
                 proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
@@ -1261,41 +1477,46 @@ class nnUNetTrainer(object):
                 while not proceed:
                     sleep(0.1)
                     proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
-                                                               allowed_num_queued=2)
+                                                                   allowed_num_queued=2)
 
                 self.print_to_log_file(f"predicting {k}")
                 data, _, seg_prev, properties = dataset_val.load_case(k)
 
-                # we do [:] to convert blosc2 to numpy
                 data = data[:]
 
                 if self.is_cascaded:
                     seg_prev = seg_prev[:]
                     data = np.vstack((data, convert_labelmap_to_one_hot(seg_prev, self.label_manager.foreground_labels,
-                                                                        output_dtype=data.dtype)))
+                                                                         output_dtype=data.dtype)))
                 with warnings.catch_warnings():
-                    # ignore 'The given NumPy array is not writable' warning
                     warnings.simplefilter("ignore")
                     data = torch.from_numpy(data)
 
                 self.print_to_log_file(f'{k}, shape {data.shape}, rank {self.local_rank}')
                 output_filename_truncated = join(validation_output_folder, k)
 
-                prediction = predictor.predict_sliding_window_return_logits(data)
-                prediction = prediction.cpu()
+                # --- GAI: 捕获 (seg, cls) 两个输出 ---
+                prediction_seg, prediction_cls = predictor.predict_sliding_window_return_logits(data)
+
+                # (1) 处理分割 (移动到 CPU)
+                prediction_seg = prediction_seg.cpu()
+
+                # (2) 处理分类 (移动到 CPU, 转换为列表, 并存储)
+                # 我们将病例 ID (k) 作为键
+                all_classification_results[k] = prediction_cls.cpu().numpy().tolist()
+                # --- GAI END ---
 
                 # this needs to go into background processes
                 results.append(
                     segmentation_export_pool.starmap_async(
                         export_prediction_from_logits, (
-                            (prediction, properties, self.configuration_manager, self.plans_manager,
+                            # --- GAI: 传递 prediction_seg 而不是 prediction ---
+                            (prediction_seg, properties, self.configuration_manager, self.plans_manager,
                              self.dataset_json, output_filename_truncated, save_probabilities),
+                            # --- GAI END ---
                         )
                     )
                 )
-                # for debug purposes
-                # export_prediction_from_logits(prediction, properties, self.configuration_manager, self.plans_manager,
-                #      self.dataset_json, output_filename_truncated, save_probabilities)
 
                 # if needed, export the softmax prediction for the next stage
                 if next_stages is not None:
@@ -1303,11 +1524,9 @@ class nnUNetTrainer(object):
                         next_stage_config_manager = self.plans_manager.get_configuration(n)
                         expected_preprocessed_folder = join(nnUNet_preprocessed, self.plans_manager.dataset_name,
                                                             next_stage_config_manager.data_identifier)
-                        # next stage may have a different dataset class, do not use self.dataset_class
                         dataset_class = infer_dataset_class(expected_preprocessed_folder)
 
                         try:
-                            # we do this so that we can use load_case and do not have to hard code how loading training cases is implemented
                             tmp = dataset_class(expected_preprocessed_folder, [k])
                             d, _, _, _ = tmp.load_case(k)
                         except FileNotFoundError:
@@ -1320,41 +1539,49 @@ class nnUNetTrainer(object):
                         output_folder = join(self.output_folder_base, 'predicted_next_stage', n)
                         output_file_truncated = join(output_folder, k)
 
-                        # resample_and_save(prediction, target_shape, output_file, self.plans_manager, self.configuration_manager, properties,
-                        #                   self.dataset_json)
                         results.append(segmentation_export_pool.starmap_async(
                             resample_and_save, (
-                                (prediction, target_shape, output_file_truncated, self.plans_manager,
+                                # --- GAI: 传递 prediction_seg 而不是 prediction ---
+                                (prediction_seg, target_shape, output_file_truncated, self.plans_manager,
                                  self.configuration_manager,
                                  properties,
                                  self.dataset_json,
                                  default_num_processes,
                                  dataset_class),
+                                # --- GAI END ---
                             )
                         ))
-                # if we don't barrier from time to time we will get nccl timeouts for large datasets. Yuck.
+                
                 if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
                     dist.barrier()
 
             _ = [r.get() for r in results]
 
-        if self.is_ddp:
-            dist.barrier()
+            # --- GAI: 保存所有分类结果 ---
+            # 只有主进程保存
+            if self.local_rank == 0 and all_classification_results:
+                self.print_to_log_file("Saving classification results...")
+                save_json(all_classification_results,
+                          join(validation_output_folder, 'classification_results.json'))
+            # --- GAI END ---
 
-        if self.local_rank == 0:
-            metrics = compute_metrics_on_folder(join(self.preprocessed_dataset_folder_base, 'gt_segmentations'),
-                                                validation_output_folder,
-                                                join(validation_output_folder, 'summary.json'),
-                                                self.plans_manager.image_reader_writer_class(),
-                                                self.dataset_json["file_ending"],
-                                                self.label_manager.foreground_regions if self.label_manager.has_regions else
-                                                self.label_manager.foreground_labels,
-                                                self.label_manager.ignore_label, chill=True,
-                                                num_processes=default_num_processes * dist.get_world_size() if
-                                                self.is_ddp else default_num_processes)
-            self.print_to_log_file("Validation complete", also_print_to_console=True)
-            self.print_to_log_file("Mean Validation Dice: ", (metrics['foreground_mean']["Dice"]),
-                                   also_print_to_console=True)
+            if self.is_ddp:
+                dist.barrier()
+
+            if self.local_rank == 0:
+                metrics = compute_metrics_on_folder(join(self.preprocessed_dataset_folder_base, 'gt_segmentations'),
+                                                    validation_output_folder,
+                                                    join(validation_output_folder, 'summary.json'),
+                                                    self.plans_manager.image_reader_writer_class(),
+                                                    self.dataset_json["file_ending"],
+                                                    self.label_manager.foreground_regions if self.label_manager.has_regions else
+                                                    self.label_manager.foreground_labels,
+                                                    self.label_manager.ignore_label, chill=True,
+                                                    num_processes=default_num_processes * dist.get_world_size() if
+                                                    self.is_ddp else default_num_processes)
+                self.print_to_log_file("Validation complete", also_print_to_console=True)
+                self.print_to_log_file("Mean Validation Dice: ", (metrics['foreground_mean']["Dice"]),
+                                       also_print_to_console=True)
 
         self.set_deep_supervision_enabled(True)
         compute_gaussian.cache_clear()
@@ -1381,3 +1608,12 @@ class nnUNetTrainer(object):
             self.on_epoch_end()
 
         self.on_train_end()
+
+
+# Plan
+# nnUNetv2_plan_and_preprocess -d 002 -pl nnUNetPlannerResEncM
+# train
+# nnUNetv2_train 002 3d_fullres 5 -p nnUNetResEncUNetMPlans 
+
+# predict
+# nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 5

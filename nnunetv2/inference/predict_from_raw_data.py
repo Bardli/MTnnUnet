@@ -265,7 +265,8 @@ class nnUNetPredictor(object):
                                                                                  output_filename_truncated,
                                                                                  num_processes_preprocessing)
 
-        return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
+        return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export,
+                                                 output_folder)
 
     def _internal_get_data_iterator_from_lists_of_filenames(self,
                                                             input_list_of_lists: List[List[str]],
@@ -348,13 +349,19 @@ class nnUNetPredictor(object):
         return self.predict_from_data_iterator(iterator, save_probabilities, num_processes_segmentation_export)
 
     def predict_from_data_iterator(self,
-                                   data_iterator,
-                                   save_probabilities: bool = False,
-                                   num_processes_segmentation_export: int = default_num_processes):
+                                     data_iterator,
+                                     save_probabilities: bool = False,
+                                     num_processes_segmentation_export: int = default_num_processes,
+                                     output_folder: str = None): # <-- GAI: 添加第 5 个参数 (output_folder)
         """
         each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
         If 'ofile' is None, the result will be returned instead of written to a file
         """
+        
+        # --- GAI: 为分类结果添加一个字典 ---
+        all_classification_results = {}
+        # --- GAI 结束 ---
+        
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
             worker_list = [i for i in export_pool._pool]
             r = []
@@ -366,6 +373,13 @@ class nnUNetPredictor(object):
                     os.remove(delfile)
 
                 ofile = preprocessed['ofile']
+                
+                # --- GAI: 如果 output_folder 未传入，尝试从 ofile 推断 ---
+                # (这确保了旧的 predict_from_data_iterator 调用仍能工作)
+                if output_folder is None and ofile is not None:
+                    output_folder = os.path.dirname(ofile)
+                # --- GAI 结束 ---
+                    
                 if ofile is not None:
                     print(f'\nPredicting {os.path.basename(ofile)}:')
                 else:
@@ -375,31 +389,37 @@ class nnUNetPredictor(object):
 
                 properties = preprocessed['data_properties']
 
-                # let's not get into a runaway situation where the GPU predicts so fast that the disk has to be swamped with
-                # npy files
+                # ... (check_workers_alive_and_busy 逻辑保持不变) ...
                 proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
                 while not proceed:
                     sleep(0.1)
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
 
-                # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
-                prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+                # --- GAI: 获取 (seg, cls) 两个预测结果 ---
+                prediction_seg, prediction_cls = self.predict_logits_from_preprocessed_data(data)
+                prediction_seg_np = prediction_seg.cpu().detach().numpy()
+                prediction_cls_np = prediction_cls.cpu().detach().numpy()
+                # --- GAI 结束 ---
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
                     r.append(
                         export_pool.starmap_async(
                             export_prediction_from_logits,
-                            ((prediction, properties, self.configuration_manager, self.plans_manager,
-                              self.dataset_json, ofile, save_probabilities),)
+                            ((prediction_seg_np, properties, self.configuration_manager, self.plans_manager,
+                             self.dataset_json, ofile, save_probabilities),)
                         )
                     )
+                    # --- GAI: 保存 cls 结果 ---
+                    case_id = os.path.basename(ofile)
+                    all_classification_results[case_id] = prediction_cls_np
+                    # --- GAI 结束 ---
                 else:
                     print('sending off prediction to background worker for resampling')
                     r.append(
                         export_pool.starmap_async(
                             convert_predicted_logits_to_segmentation_with_correct_shape, (
-                                (prediction, self.plans_manager,
+                                (prediction_seg_np, self.plans_manager,
                                  self.configuration_manager, self.label_manager,
                                  properties,
                                  save_probabilities),)
@@ -413,6 +433,14 @@ class nnUNetPredictor(object):
 
         if isinstance(data_iterator, MultiThreadedAugmenter):
             data_iterator._finish()
+
+        # --- GAI: 将所有 CLS 结果保存到 JSON 文件 ---
+        # (现在使用传入的 output_folder)
+        if all_classification_results and output_folder is not None:
+            print(f"Saving classification results to {join(output_folder, 'classification_results.json')}")
+            cls_results_exportable = {k: v.tolist() for k, v in all_classification_results.items()}
+            save_json(cls_results_exportable, join(output_folder, 'classification_results.json'))
+        # --- GAI 结束 ---
 
         # clear lru cache
         compute_gaussian.cache_clear()
@@ -479,29 +507,41 @@ class nnUNetPredictor(object):
         n_threads = torch.get_num_threads()
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
         prediction = None
+        # --- GAI: 为 seg 和 cls 创建累加器 ---
+        prediction_seg = None
+        prediction_cls = None
+        # --- GAI 结束 ---
 
         for params in self.list_of_parameters:
-
-            # messing with state dict names...
+            # ... (加载 network state_dict) ...
             if not isinstance(self.network, OptimizedModule):
                 self.network.load_state_dict(params)
             else:
                 self.network._orig_mod.load_state_dict(params)
 
-            # why not leave prediction on device if perform_everything_on_device? Because this may cause the
-            # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
-            # this actually saves computation time
-            if prediction is None:
-                prediction = self.predict_sliding_window_return_logits(data).to('cpu')
+            if prediction_seg is None:
+                # --- GAI: 获取 (seg, cls) 元组 ---
+                prediction_seg, prediction_cls = self.predict_sliding_window_return_logits(data)
+                prediction_seg = prediction_seg.to('cpu')
+                prediction_cls = prediction_cls.to('cpu')
+                # --- GAI 结束 ---
             else:
-                prediction += self.predict_sliding_window_return_logits(data).to('cpu')
+                # --- GAI: 累加 (seg, cls) 元组 ---
+                next_pred_seg, next_pred_cls = self.predict_sliding_window_return_logits(data)
+                prediction_seg += next_pred_seg.to('cpu')
+                prediction_cls += next_pred_cls.to('cpu')
+                # --- GAI 结束 ---
 
         if len(self.list_of_parameters) > 1:
-            prediction /= len(self.list_of_parameters)
+            # --- GAI: 平均 (seg, cls) 元组 ---
+            prediction_seg /= len(self.list_of_parameters)
+            prediction_cls /= len(self.list_of_parameters)
+            # --- GAI 结束 ---
 
         if self.verbose: print('Prediction done')
         torch.set_num_threads(n_threads)
-        return prediction
+        
+        return prediction_seg, prediction_cls # GAI: 返回元组
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
         slicers = []
@@ -537,10 +577,37 @@ class nnUNetPredictor(object):
                                                   zip((sx, sy, sz), self.configuration_manager.patch_size)]]))
         return slicers
 
+    # @torch.inference_mode()
+    # def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
+    #     mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
+    #     prediction = self.network(x)
+
+    #     if mirror_axes is not None:
+    #         # check for invalid numbers in mirror_axes
+    #         # x should be 5d for 3d images and 4d for 2d. so the max value of mirror_axes cannot exceed len(x.shape) - 3
+    #         assert max(mirror_axes) <= x.ndim - 3, 'mirror_axes does not match the dimension of the input!'
+
+    #         mirror_axes = [m + 2 for m in mirror_axes]
+    #         axes_combinations = [
+    #             c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
+    #         ]
+    #         for axes in axes_combinations:
+    #             prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
+    #         prediction /= (len(axes_combinations) + 1)
+    #     return prediction
     @torch.inference_mode()
-    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
+    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]: # GAI: 返回元组
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
-        prediction = self.network(x)
+        
+        # --- GAI (修改点 1) ---
+        # 我们的模型返回 (seg, cls)。
+        network_output_seg, network_output_cls = self.network(x)
+        
+        # 初始化累加器
+        prediction_seg = network_output_seg
+        prediction_cls = network_output_cls # 形状 [1, Num_Classes]
+        num_predictions = 1
+        # --- GAI 结束 ---
 
         if mirror_axes is not None:
             # check for invalid numbers in mirror_axes
@@ -552,9 +619,23 @@ class nnUNetPredictor(object):
                 c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
             ]
             for axes in axes_combinations:
-                prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
-            prediction /= (len(axes_combinations) + 1)
-        return prediction
+                # --- GAI (修改点 2) ---
+                # 再次调用网络并获取两个输出
+                mirrored_output_seg, mirrored_output_cls = self.network(torch.flip(x, axes))
+                
+                # 累加 TTA 结果
+                prediction_seg += torch.flip(mirrored_output_seg, axes)
+                prediction_cls += mirrored_output_cls
+                num_predictions += 1
+                # --- GAI 结束 ---
+        
+        # --- GAI (修改点 3) ---
+        # 分别对 seg 和 cls 进行平均
+        prediction_seg /= num_predictions
+        prediction_cls /= num_predictions
+        
+        return prediction_seg, prediction_cls # GAI: 返回两个结果
+        # --- GAI 结束 ---
 
     @torch.inference_mode()
     def _internal_predict_sliding_window_return_logits(self,
@@ -564,7 +645,8 @@ class nnUNetPredictor(object):
                                                        ):
         predicted_logits = n_predictions = prediction = gaussian = workon = None
         results_device = self.device if do_on_device else torch.device('cpu')
-
+        # --- GAI: 为分类结果添加一个累加器 ---
+        all_cls_predictions = []
         def producer(d, slh, q):
             for s in slh:
                 q.put((torch.clone(d[s][None], memory_format=torch.contiguous_format).to(self.device), s))
@@ -584,11 +666,11 @@ class nnUNetPredictor(object):
             # preallocate arrays
             if self.verbose:
                 print(f'preallocating results arrays on device {results_device}')
+            # --- GAI: preallocate arrays (分割部分保持不变) ---
             predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
                                            dtype=torch.half,
                                            device=results_device)
             n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
-
             if self.use_gaussian:
                 gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
                                             value_scaling_factor=10,
@@ -606,11 +688,19 @@ class nnUNetPredictor(object):
                         queue.task_done()
                         break
                     workon, sl = item
-                    prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
+                    # --- GAI: 从 TTA 获取 (seg, cls) ---
+                    prediction_seg, prediction_cls = self._internal_maybe_mirror_and_predict(workon)
+                    prediction_seg = prediction_seg.to(results_device)
+                    
+                    # 累加分类预测
+                    all_cls_predictions.append(prediction_cls.to(results_device))
+                    # --- GAI 结束 ---
 
                     if self.use_gaussian:
-                        prediction *= gaussian
-                    predicted_logits[sl] += prediction
+                        prediction_seg *= gaussian
+                    
+                    #predicted_logits [sl] is [3, 64, 128, 192], prediction_seg is [1, 3, 64, 128, 192]
+                    predicted_logits[sl] += prediction_seg[0]
                     n_predictions[sl[1:]] += gaussian
                     queue.task_done()
                     pbar.update()
@@ -623,12 +713,22 @@ class nnUNetPredictor(object):
                 raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
                                    'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
                                    'predicted_logits to fp32')
+            # --- GAI: 聚合分类结果 ---
+            # 堆叠所有补丁的预测 [Num_Patches, 1 (Batch_Size), Num_Classes]
+            if all_cls_predictions:
+                aggregated_cls_preds = torch.stack(all_cls_predictions)
+                # 在所有补丁上取平均值 (dim=0)
+                final_cls_pred = torch.mean(aggregated_cls_preds, dim=0)
+            else:
+                # 理论上不应该发生，但作为回退
+                final_cls_pred = torch.empty((0, 0), device=results_device) 
+            # --- GAI 结束 ---
         except Exception as e:
             del predicted_logits, n_predictions, prediction, gaussian, workon
             empty_cache(self.device)
             empty_cache(results_device)
             raise e
-        return predicted_logits
+        return predicted_logits, final_cls_pred # GAI: 返回两个结果
 
     @torch.inference_mode()
     def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \
@@ -661,23 +761,24 @@ class nnUNetPredictor(object):
             slicers = self._internal_get_sliding_window_slicers(data.shape[1:])
 
             if self.perform_everything_on_device and self.device != 'cpu':
-                # we need to try except here because we can run OOM in which case we need to fall back to CPU as a results device
                 try:
-                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
-                                                                                           self.perform_everything_on_device)
+                    # --- GAI: 接收 (seg, cls) 元组 ---
+                    predicted_logits, predicted_cls = self._internal_predict_sliding_window_return_logits(data, slicers,
+                                                                                       self.perform_everything_on_device)
                 except RuntimeError:
                     print(
                         'Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
                     empty_cache(self.device)
-                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+                    predicted_logits, predicted_cls = self._internal_predict_sliding_window_return_logits(data, slicers, False)
             else:
-                predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
-                                                                                       self.perform_everything_on_device)
-
+                predicted_logits, predicted_cls = self._internal_predict_sliding_window_return_logits(data, slicers,
+                                                                                   self.perform_everything_on_device)
             empty_cache(self.device)
             # revert padding
             predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
-        return predicted_logits
+            
+            # --- GAI: 返回两个结果 ---
+            return predicted_logits, predicted_cls
 
     def predict_from_files_sequential(self,
                            list_of_lists_or_source_folder: Union[str, List[List[str]]],
