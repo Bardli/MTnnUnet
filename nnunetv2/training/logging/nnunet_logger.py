@@ -29,7 +29,9 @@ class nnUNetLogger(object):
             'val_loss_seg': list(),
             'val_loss_cls': list(),
             'val_macro_f1': list(),
-            'val_accuracy': list()
+            'val_accuracy': list(),
+            'val_classification_targets': list(),
+            'val_classification_predictions': list()
         }
         self.verbose = verbose
         # shut up, this logging is great
