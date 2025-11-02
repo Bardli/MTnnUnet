@@ -239,7 +239,7 @@ class nnUNetTrainer(object):
             self.cls_loss = torch.nn.CrossEntropyLoss() # 或者 BCEWithLogitsLoss 等
             # new segmentation loss
             self.lambda_seg = 1.0 # 分割损失的权重
-            self.lambda_cls = 0.1 # 分类损失的权重 (示例)
+            self.lambda_cls = 100.0 # 分类损失的权重 (示例)
 
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
@@ -1144,7 +1144,7 @@ class nnUNetTrainer(object):
 
             # (b) 计算分类损失
             l_cls = self.cls_loss(output_cls, target_cls)
-
+            # print(f"Classification output: {output_cls}")
             # (c) 计算加权总损失
             l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
 
@@ -1211,7 +1211,7 @@ class nnUNetTrainer(object):
         else:
             target_seg = target_seg.to(self.device, non_blocking=True)
 
-        # Autocast... (保持不变)
+        # Autocast
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             # 3. 修改：获取两个网络输出
             output_seg, output_cls = self.network(data)
@@ -1232,7 +1232,7 @@ class nnUNetTrainer(object):
         # 6. 修改：使用分割输出计算 axes
         axes = [0] + list(range(2, output_seg.ndim))
 
-        # 7. 修改：使用分割输出计算 one-hot 预测
+        # 7. 使用分割输出计算 one-hot 预测
         if self.label_manager.has_regions:
             predicted_segmentation_onehot = (torch.sigmoid(output_seg) > 0.5).long()
         else:
@@ -1258,7 +1258,7 @@ class nnUNetTrainer(object):
         else:
             mask = None
 
-        # 9. 修改：使用分割目标计算 tp, fp, fn
+        # 9.使用分割目标计算 tp, fp, fn
         tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target_seg, axes=axes, mask=mask)
 
         tp_hard = tp.detach().cpu().numpy()
@@ -1270,7 +1270,7 @@ class nnUNetTrainer(object):
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
 
-        # 10. 修改：返回包含所有指标的字典
+        # 10. 返回包含所有指标的字典
         return {
             'loss': l.detach().cpu().numpy(),           # 总损失
             'loss_seg': l_seg.detach().cpu().numpy(),   # 分割损失 (用于日志)
@@ -1362,8 +1362,8 @@ class nnUNetTrainer(object):
         self.logger.log('val_losses', loss_here, self.current_epoch)
         self.logger.log('val_loss_seg', loss_seg_here, self.current_epoch)
         self.logger.log('val_loss_cls', loss_cls_here, self.current_epoch)
-        self.logger.log('val_classification_targets', cls_targets.tolist(),  self.current_epoch)
-        self.logger.log('val_classification_predictions', cls_preds.tolist(),  self.current_epoch)
+        # self.logger.log('val_classification_targets', cls_targets.tolist(),  self.current_epoch)
+        # self.logger.log('val_classification_predictions', cls_preds.tolist(),  self.current_epoch)
         self.logger.log('val_macro_f1', macro_f1, self.current_epoch)
         self.logger.log('val_accuracy', accuracy, self.current_epoch)
 
@@ -1402,8 +1402,8 @@ class nnUNetTrainer(object):
         self.print_to_log_file('Mean Foreground Dice', np.round(self.logger.my_fantastic_logging['mean_fg_dice'][-1], decimals=4))
 
         # --- GAI: 打印分类指标 ---
-        self.print_to_log_file('val_classification_targets', self.logger.my_fantastic_logging['val_classification_targets'][-1])
-        self.print_to_log_file('val_classification_predictions', self.logger.my_fantastic_logging['val_classification_predictions'][-1])
+        # self.print_to_log_file('val_classification_targets', self.logger.my_fantastic_logging['val_classification_targets'][-1])
+        # self.print_to_log_file('val_classification_predictions', self.logger.my_fantastic_logging['val_classification_predictions'][-1])
         self.print_to_log_file('val_accuracy', np.round(self.logger.my_fantastic_logging['val_accuracy'][-1], decimals=4))
         self.print_to_log_file('val_macro_f1', np.round(self.logger.my_fantastic_logging['val_macro_f1'][-1], decimals=4))
         # --- GAI END ---
@@ -1679,7 +1679,7 @@ class nnUNetTrainer(object):
 # Plan
 # nnUNetv2_plan_and_preprocess -d 002 -pl nnUNetPlannerResEncM
 # train
-# nnUNetv2_train 002 3d_fullres 5 -p nnUNetResEncUNetMPlans 
+# nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans 
 
 # predict
 # nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 5
