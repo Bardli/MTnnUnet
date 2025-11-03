@@ -9,44 +9,13 @@ import os
 from dynamic_network_architectures.building_blocks.residual import StackedResidualBlocks, BasicBlockD
 from dynamic_network_architectures.building_blocks.simple_conv_blocks import StackedConvBlocks
 from dynamic_network_architectures.building_blocks.helper import get_matching_convtransp, maybe_convert_scalar_to_list
-# from nnunetv2.training.loss.dice import DC_and_CE_loss
-# from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
-# from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss
 # --- GradNorm START: 添加新 imports ---
-# class DC_and_CE_loss_MTL(DC_and_CE_loss):
-#     """
-#     此损失函数假定网络输出是一个元组 (seg_output, cls_output)
-#     并且 target 也是一个元组 (seg_target, cls_target)
-#     它分别计算分割损失和分类损失
-#     """
-#     def __init__(self, soft_dice_kwargs, ce_kwargs, weight_ce=1, weight_dice=1, ignore_label=None,
-#                  dice_class=None, ce_class=RobustCrossEntropyLoss):
-#         super().__init__(soft_dice_kwargs, ce_kwargs, weight_ce, weight_dice, ignore_label, dice_class)
-#         # 为分类任务单独实例化一个CE损失
-#         self.cls_loss_func = ce_class(**ce_kwargs)
-#         self.weight_ce = weight_ce # 这将被用于 cls_loss
-        
-#         # --- GradNorm START: 将可学习的权重定义为 nn.Parameter ---
-#         # 这确保它们被注册为模块的一部分，并可以被优化器看到
-#         self.loss_weight_seg = torch.nn.Parameter(torch.tensor(1.0))
-#         self.loss_weight_cls = torch.nn.Parameter(torch.tensor(1.0))
-#         # --- GradNorm END ---
-
-#     def forward(self, net_output: tuple, target: tuple):
-#         seg_output, cls_output = net_output
-#         seg_target, cls_target = target
-        
-#         # 1. 计算分割损失 (来自父类)
-#         loss_seg = super()._forward(seg_output, seg_target)
-        
-#         # 2. 计算分类损失
-#         cls_target = cls_target.long()
-#         loss_cls = self.weight_ce * self.cls_loss_func(cls_output, cls_target)
-        
-#         # 3. 返回一个 *未加权* 的损失字典
-#         # Trainer 的 training_step 将会处理加权
-#         return {'loss_seg': loss_seg, 'loss_cls': loss_cls}
-    
+from torch.autograd import grad
+import torch.nn.functional as F
+# ---------------------------------------------------------------------
+# 2. 复用 ClassificationHead 和 CrossAttentionPooling
+# (这部分代码无需修改)
+# ---------------------------------------------------------------------
 class CrossAttentionPooling(nn.Module):
     def __init__(self, embed_dim, query_num, num_classes, num_heads=4, dropout=0.0):
         super(CrossAttentionPooling, self).__init__()
@@ -61,9 +30,6 @@ class CrossAttentionPooling(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(query_num * embed_dim, num_classes)
         self._init_weights()
-
-
-        
     def _init_weights(self):
         nn.init.xavier_uniform_(self.class_query)
         nn.init.xavier_uniform_(self.classifier.weight)
@@ -152,9 +118,6 @@ class ResNet_MTL_nnUNet(nn.Module):
         self.deep_supervision = deep_supervision
         self.num_classes = num_classes # 分割类别数
         self.n_stages = n_stages
-        # ---  ：为不确定性加权损失添加可学习的 log_var 参数  ---
-        # self.log_var_seg = nn.Parameter(torch.zeros(1), requires_grad=True)
-        # self.log_var_cls = nn.Parameter(torch.zeros(1), requires_grad=True)
 
         # ---------------------------------
         # 1. 构建共享 3D ResNet 编码器

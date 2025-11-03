@@ -239,7 +239,7 @@ class nnUNetTrainer(object):
             self.cls_loss = torch.nn.CrossEntropyLoss() # 或者 BCEWithLogitsLoss 等
             # new segmentation loss
             self.lambda_seg = 1.0 # 分割损失的权重
-            self.lambda_cls = 100.0 # 分类损失的权重 (示例)
+            self.lambda_cls = 0.5 # 分类损失的权重 
 
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
@@ -951,12 +951,9 @@ class nnUNetTrainer(object):
         # which may not be present  when doing inference
         self.dataloader_train, self.dataloader_val = self.get_dataloaders()
 
-        # -----------------------------------------------------------------
-        # ★★★ START: 插入解决类别不平衡的代码 (已修复) ★★★
-        # -----------------------------------------------------------------
         self.print_to_log_file("Calculating class weights for imbalanced classification task...")
         
-        # 1. (修复) 正确访问 nnUNetDataset
+        # 1. 正确访问 nnUNetDataset
         #    路径是: NonDetMultiThreadedAugmenter -> nnUNetDataLoader -> nnUNetDataset
         if self.tr_keys is None:
              raise RuntimeError("self.tr_keys was not set in get_tr_and_val_datasets. This should not happen.")
@@ -964,7 +961,7 @@ class nnUNetTrainer(object):
         
         # 2. 解析 'keys' 以获取标签 (假设格式为 'quiz_LABEL_...')
         try:
-            # 假设标签是整数 (0, 1, 2, ...)
+            # 标签是整数 (0, 1, 2, ...)
             tr_labels = [int(k.split('_')[1]) for k in tr_keys]
         except Exception as e:
             self.print_to_log_file(f"!!! WARNING: Could not parse labels from training keys for weighted loss.")
@@ -1008,9 +1005,7 @@ class nnUNetTrainer(object):
                     self.print_to_log_file(f"Class counts (this fold): {counts}")
                     self.print_to_log_file(f"Class weights (this fold): {weights}")
 
-        # -----------------------------------------------------------------
-        # ★★★ END: 插入的代码结束 ★★★
-        # -----------------------------------------------------------------
+
         maybe_mkdir_p(self.output_folder)
 
         # make sure deep supervision is on in the network
@@ -1138,15 +1133,24 @@ class nnUNetTrainer(object):
             # --- 3. 修改：计算加权组合损失 ---
             # 假设您在 initialize() 中定义了 self.seg_loss, self.cls_loss, 
             # 以及 self.lambda_seg, self.lambda_cls
-
+            
+            
+            # main test for deep supervision
+            # if isinstance(output_seg, list):
+            #     output_seg_tensor = output_seg[0]
+            # else:
+            #     output_seg_tensor = output_seg
             # (a) 计算分割损失 (与之前相同)
-            l_seg = self.seg_loss(output_seg, target_seg)
+            # l_seg = self.seg_loss(output_seg_tensor, target_seg)
 
+
+            l_seg = self.seg_loss(output_seg, target_seg)
             # (b) 计算分类损失
             l_cls = self.cls_loss(output_cls, target_cls)
-            # print(f"Classification output: {output_cls}")
-            # (c) 计算加权总损失
-            l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
+            l = self.lambda_seg * l_seg + self.lambda_cls * l_cls
+
+            # (c) 总损失现在是两个独立部分的和
+            # l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1683,3 +1687,101 @@ class nnUNetTrainer(object):
 
 # predict
 # nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 5
+
+
+if __name__ == "__main__":
+    import torch
+    import numpy as np
+    from torch import nn
+    from nnunetv2.training.nnUNetTrainer.variants.network_architecture.ResNet_MTL_nnUNet import ResNet_MTL_nnUNet  # ⚠️ 确保你的模型类路径正确（根据项目结构调整）
+    from dynamic_network_architectures.building_blocks.residual import BasicBlockD
+
+
+    print("🚀 Debug training using ResNet_MTL_nnUNet + nnUNetTrainer ...")
+
+    # ===============================================================
+    # 1️⃣ 初始化模型（参数配置与你在主脚本中一致）
+    # ===============================================================
+    unet_config = {
+        "input_channels": 1,
+        "n_stages": 6,
+        "features_per_stage": (32, 64, 128, 256, 320, 320),
+        "conv_op": nn.Conv3d,
+        "kernel_sizes": ((3, 3, 3),) * 6,
+        "strides": ((1, 1, 1), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)),
+        "n_blocks_per_stage": (2, 2, 2, 2, 2, 2),
+        "num_classes": 2,  # segmentation
+        "n_conv_per_stage_decoder": (2, 2, 2, 2, 2),
+        "conv_bias": True,
+        "norm_op": nn.InstanceNorm3d,
+        "norm_op_kwargs": {"eps": 1e-05, "affine": True},
+        "dropout_op": None,
+        "dropout_op_kwargs": None,
+        "nonlin": nn.LeakyReLU,
+        "nonlin_kwargs": {"inplace": True},
+        "deep_supervision": True,
+        "block": BasicBlockD,
+        "cls_num_classes": 3,
+        "cls_query_num": 8,
+        "cls_dropout": 0.1,
+        "use_cross_attention": True,
+    }
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ResNet_MTL_nnUNet(**unet_config).to(device)
+
+    # ===============================================================
+    # 2️⃣ 模拟 nnUNetTrainer 环境
+    # ===============================================================
+    from nnUNetTrainer import nnUNetTrainer  # 确认类名正确
+    trainer = nnUNetTrainer.__new__(nnUNetTrainer)  # 不调用 init
+    trainer.device = device
+    trainer.network = model
+    trainer.optimizer = torch.optim.SGD(model.parameters(), lr=1e-3, momentum=0.9)
+    trainer.grad_scaler = None
+    trainer.lambda_seg = 1.0
+    trainer.lambda_cls = 1.0
+    trainer.seg_loss = nn.CrossEntropyLoss()
+    trainer.cls_loss = nn.CrossEntropyLoss()
+
+    # ===============================================================
+    # 3️⃣ 构造假数据
+    # ===============================================================
+    B, C, D, H, W = 2, 1, 64, 64, 64
+    dummy_data = torch.randn(B, C, D, H, W).to(device)
+    dummy_seg = torch.randint(0, 2, (B, D, H, W)).to(device)
+    dummy_cls = torch.randint(0, 3, (B,)).to(device)
+
+    batch = {
+        'data': dummy_data,
+        'target': dummy_seg,
+        'class_label': dummy_cls
+    }
+
+    # ===============================================================
+    # 4️⃣ 调用 train_step（调试模式）
+    # ===============================================================
+    print("\n===== Running one debug train step =====")
+    result = trainer.train_step(batch)
+
+    print("\n✅ Train step finished.")
+    print(f"Loss_total={result['loss']:.4f}, "
+          f"Loss_seg={result['loss_seg']:.4f}, "
+          f"Loss_cls={result['loss_cls']:.4f}")
+
+    # ===============================================================
+    # 5️⃣ 打印分类头梯度
+    # ===============================================================
+    print("\n--- Classification Head Gradient Debug ---")
+    found_grad = False
+    for name, p in trainer.network.named_parameters():
+        if 'classification_head' in name or 'cls' in name:
+            if p.grad is None:
+                print(f"[!] No grad for {name}")
+            else:
+                print(f"grad[{name}] mean={p.grad.abs().mean().item():.6f}")
+                found_grad = True
+    if not found_grad:
+        print("⚠️ No classification head gradients detected!")
+
+    print("\n🎯 Debug complete — if you see nonzero grad above, classification head is learning!")
