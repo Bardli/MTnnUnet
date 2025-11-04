@@ -152,7 +152,7 @@ class ResNet_MTL_nnUNet(nn.Module):
         self.deep_supervision = deep_supervision
         self.num_classes = num_classes # 分割类别数
         self.n_stages = n_stages
-        # ---  ：为不确定性加权损失添加可学习的 log_var 参数  ---
+        # ---  ：为不确定性加权损失添加可学习的 log_var 参数  ---
         # self.log_var_seg = nn.Parameter(torch.zeros(1), requires_grad=True)
         # self.log_var_cls = nn.Parameter(torch.zeros(1), requires_grad=True)
 
@@ -210,59 +210,46 @@ class ResNet_MTL_nnUNet(nn.Module):
         # 3. ★★★ 构建新的聚合分类头 (Cls Head) ★★★
         # ---------------------------------
         
-        # 瓶颈层的特征数
-        bottleneck_features_dim = features_per_stage[-1]
-        
-        # 总特征维度 = 编码器所有阶段 + 瓶颈层 的特征总和
+        # 总特征维度 = 编码器所有阶段的特征总和
+        # (例如: 32 + 64 + 128 + 256 + 320 + 320 = 1120)
         total_cls_input_dim = sum(features_per_stage)
 
-        # --- 新增：为分类任务添加一个“适配器” ---
-        # 这个模块将瓶颈特征图转换为分类特征图
-        self.cls_adapter = nn.Sequential(
-            StackedConvBlocks(
-                2, conv_op, bottleneck_features_dim, bottleneck_features_dim,
-                kernel_sizes[-1], 1, conv_bias, norm_op, norm_op_kwargs,
-                dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs
-            ),
-            # 你可以选择在这里使用 1x1x1 卷积来改变维度，
-            # 但保持维度一致通常是安全的。
-            conv_op(bottleneck_features_dim, total_cls_input_dim, 1, 1, 0, bias=True)
-        )
+        # --- ★★★ 新逻辑 (基于图像) ★★★ ---
+        # 我们不再需要 cls_adapter
+        # self.cls_adapter = ... (已删除)
         
-
-        # 你的 classification_head 定义保持不变
-        # (无论是使用 CrossAttention 还是简单的 MLP)
+        # 你的 classification_head 定义与图像中的 Dense->Dropout->Dense 结构完美匹配
+        # 它的输入维度 (total_cls_input_dim) 已经正确
         self.classification_head = nn.Sequential(
-        nn.Linear(total_cls_input_dim, total_cls_input_dim // 2),
-        nn.ReLU(inplace=True),
-        nn.Dropout(cls_dropout),
-        nn.Linear(total_cls_input_dim // 2, cls_num_classes)
+            nn.Linear(total_cls_input_dim, total_cls_input_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(cls_dropout),
+            nn.Linear(total_cls_input_dim // 2, cls_num_classes)
         )
+        # --- ★★★ 结束 ★★★ ---
 
     def forward(self, x: torch.Tensor) -> Tuple[Union[torch.Tensor, List[torch.Tensor]], torch.Tensor]:
         
         skips = []
-        cls_feature_list = [] # 用于 PANDA/iAorta 策略的特征列表
+        cls_feature_list = [] # 用于收集所有编码器阶段的特征
         
         # ---------------------------------
         # 1. & 2. 编码器 + 瓶颈层
         # ---------------------------------
-        # self.conv_encoder_blocks 列表包含了 stem 和所有 encoder 阶段
-        # (共 n_stages 个块)
         x_enc = x
         
         # 迭代 n_stages 次 (例如 6 次)
-        # self.n_stages 是在 __init__ 中定义的
         for i in range(self.n_stages): 
             x_enc = self.conv_encoder_blocks[i](x_enc)
-            skips.append(x_enc)
+            
+            # 分割解码器需要 skip connection
+            skips.append(x_enc) 
+            
+            # ★★★ 分类头需要所有阶段的特征 ★★★
             cls_feature_list.append(x_enc) 
-            # cls_feature_list 现在包含了 stem, stage 1, ..., stage 5 (瓶颈层)
-            # 的所有 (n_stages) 个特征图
         
         # 瓶颈层特征已经是 skips 列表的最后一项
         bottleneck_features = skips[-1] 
-        # (不需要再向 cls_feature_list 添加任何东西)
 
         # ---------------------------------
         # 3. 分割解码器 (Seg Decoder)
@@ -272,11 +259,6 @@ class ResNet_MTL_nnUNet(nn.Module):
         
         # 迭代 (n_stages - 1) 次 (例如 5 次)
         for i in range(len(self.decoder_blocks)):
-            # 编码器有 n_stages 个输出 (skips 列表)
-            # 解码器有 (n_stages - 1) 个块
-            # 第 i 个解码器块 (i=0..n_stages-2)
-            # 需要连接第 (n_stages - 2 - i) 个 skip
-            # 这等于 skips[-(i + 2)]
             skip_connection = skips[-(i + 2)] 
             x_dec = self.transpconvs[i](x_dec)
             x_dec = torch.cat((x_dec, skip_connection), dim=1)
@@ -285,23 +267,30 @@ class ResNet_MTL_nnUNet(nn.Module):
             seg_outputs.append(self.seg_layers[i](x_dec))
 
         # ---------------------------------
-        # 4. ★★★ 完成分类头的计算 ★★★
+        # 4. ★★★ 完成分类头的计算 (新逻辑) ★★★
         # ---------------------------------
-        # (d) cls_feature_list 已经包含了所有编码器/瓶颈层的特征图
-        #    它的长度应该等于 n_stages
+        
+        # (a) 对 'cls_feature_list' 中的 *每个* 特征图应用 GAP
+        # f.mean(dim=[-1, -2, -3]) 是一个 3D 全局平均池化
         pooled_features = [f.mean(dim=[-1, -2, -3]) for f in cls_feature_list]
         
-        # (e) 拼接所有尺度的特征向量
+        # (b) 拼接所有尺度的特征向量 (Concat)
+        # 
+        # 维度示例 (batch_size=2):
+        # pooled_features[0] -> [2, 32]
+        # pooled_features[1] -> [2, 64]
+        # ...
+        # pooled_features[5] -> [2, 320]
+        #
+        # combined_vector -> [2, (32+64+128+256+320+320)] = [2, 1120]
         combined_vector = torch.cat(pooled_features, dim=1)
 
-        # 添加 cls_adapter 调用（
-        adapted_feature = self.cls_adapter(cls_feature_list[-1])  # <--- 🔥 用瓶颈层特征适配
-        class_input = adapted_feature.mean(dim=[-1, -2, -3])   # shape: [B, 1120]
-        # (f) 得到最终分类输出
-        #     self.classification_head 是你在 __init__ 中定义的 MLP
-        # class_output = self.classification_head(combined_vector)
-        class_output = self.classification_head(class_input)
-
+        # (c) 得到最终分类输出
+        # self.classification_head 是在 __init__ 中定义的 MLP
+        # 它期望输入 [B, 1120] 并输出 [B, cls_num_classes]
+        class_output = self.classification_head(combined_vector)
+        # --- ★★★ 结束 ★★★ ---
+        
         # ---------------------------------
         # 5. 格式化分割输出 (保持不变)
         # ---------------------------------
@@ -356,9 +345,9 @@ if __name__ == '__main__':
         
         # 传入分类头的特定参数
         cls_num_classes=cls_classes,
-        cls_query_num=16,          # 使用 16 个 query "探针"
+        cls_query_num=16,          # <-- 这个参数现在没用了，但保留它不会出错
         cls_dropout=0.1,
-        use_cross_attention=True
+        use_cross_attention=True   # <-- 这个参数现在也没用了，但保留它不会出错
     ).to(device)
 
     # --- 3. 测试前向传播 ---
@@ -371,11 +360,21 @@ if __name__ == '__main__':
     print(f"Input shape: {dummy_input.shape}")
     print("-" * 30)
     print(f"Classification output shape: {class_output.shape}")
+    print(f"Expected: (2, {cls_classes})")
     print("-" * 30)
     
     print("Segmentation outputs (Deep Supervision):")
     if isinstance(seg_output, list):
         for i, out in enumerate(seg_output):
-            print(f"  Level {i} (High-res to Low-res): {out.shape}")
+            print(f"   Level {i} (High-res to Low-res): {out.shape}")
     else:
-        print(f"  Output shape: {seg_output.shape}")
+        print(f"   Output shape: {seg_output.shape}")
+        
+    # 检查分类头的输入维度是否正确
+    # (32+64+128+256+320+320 = 1120)
+    expected_dim = sum(unet_config['features_per_stage'])
+    print("-" * 30)
+    print(f"Classification head MLP input dim: {model.classification_head[0].in_features}")
+    print(f"Expected MLP input dim:        {expected_dim}")
+    assert model.classification_head[0].in_features == expected_dim
+    print("Shape check PASSED.")

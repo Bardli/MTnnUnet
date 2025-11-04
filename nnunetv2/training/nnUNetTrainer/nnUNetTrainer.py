@@ -237,9 +237,8 @@ class nnUNetTrainer(object):
             self.seg_loss = self._build_loss()
             # new classification loss
             self.cls_loss = torch.nn.CrossEntropyLoss() # 或者 BCEWithLogitsLoss 等
-            # new segmentation loss
-            self.lambda_seg = 1.0 # 分割损失的权重
-            self.lambda_cls = 0.5 # 分类损失的权重 
+
+
 
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
@@ -1129,24 +1128,13 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             #Assume the network returns a tuple of (segmentation_output, classification_output)
             output_seg, output_cls = self.network(data)
-
-            # --- 3. 修改：计算加权组合损失 ---
-            # 假设您在 initialize() 中定义了 self.seg_loss, self.cls_loss, 
-            # 以及 self.lambda_seg, self.lambda_cls
             
-            
-            # main test for deep supervision
-            # if isinstance(output_seg, list):
-            #     output_seg_tensor = output_seg[0]
-            # else:
-            #     output_seg_tensor = output_seg
-            # (a) 计算分割损失 (与之前相同)
-            # l_seg = self.seg_loss(output_seg_tensor, target_seg)
-
+            self.lambda_seg = 0.0 # 分割损失的权重
+            self.lambda_cls = 1 # 分类损失的权重 
 
             l_seg = self.seg_loss(output_seg, target_seg)
-            # (b) 计算分类损失
             l_cls = self.cls_loss(output_cls, target_cls)
+
             l = self.lambda_seg * l_seg + self.lambda_cls * l_cls
 
             # (c) 总损失现在是两个独立部分的和
@@ -1627,13 +1615,12 @@ class nnUNetTrainer(object):
 
             _ = [r.get() for r in results]
 
-            # --- GAI: 保存所有分类结果 ---
-            # 只有主进程保存
+
             if self.local_rank == 0 and all_classification_results:
                 self.print_to_log_file("Saving classification results...")
                 save_json(all_classification_results,
                           join(validation_output_folder, 'classification_results.json'))
-            # --- GAI END ---
+
 
             if self.is_ddp:
                 dist.barrier()
