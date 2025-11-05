@@ -156,9 +156,10 @@ class nnUNetTrainer(object):
         self.num_val_iterations_per_epoch = 50
         self.num_epochs = 1000
         self.current_epoch = 0
-        self.enable_deep_supervision = False
+        self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
         self.task_mode = 'seg_only'
+        self.cls_patch_size = (78, 146, 214)
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -219,8 +220,9 @@ class nnUNetTrainer(object):
                 self.configuration_manager.network_arch_init_kwargs_req_import,
                 self.num_input_channels,
                 self.label_manager.num_segmentation_heads,
-                self.enable_deep_supervision,
-                task_mode=self.task_mode
+                task_mode=self.task_mode,
+                enable_deep_supervision=self.enable_deep_supervision,
+
             ).to(self.device)
             # compile network for free speedup
             if self._do_i_compile():
@@ -451,11 +453,13 @@ class nnUNetTrainer(object):
 
         return loss
 
-    def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self):
+    def configure_rotation_dummyDA_mirroring_and_inital_patch_size(self, patch_size=None):
         """
-        This function is stupid and certainly one of the weakest spots of this implementation. Not entirely sure how we can fix it.
+        原版函数 + 支持自定义 patch_size（比如 cls_only 时用 cls_patch_size）
         """
-        patch_size = self.configuration_manager.patch_size
+        if patch_size is None:
+            patch_size = self.configuration_manager.patch_size
+
         dim = len(patch_size)
         # todo rotation should be defined dynamically based on patch size (more isotropic patch sizes = more rotation)
         if dim == 2:
@@ -467,11 +471,9 @@ class nnUNetTrainer(object):
                 rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
             mirror_axes = (0, 1)
         elif dim == 3:
-            # todo this is not ideal. We could also have patch_size (64, 16, 128) in which case a full 180deg 2d rot would be bad
             # order of the axes is determined by spacing, not image size
             do_dummy_2d_data_aug = (max(patch_size) / patch_size[0]) > ANISO_THRESHOLD
             if do_dummy_2d_data_aug:
-                # why do we rotate 180 deg here all the time? We should also restrict it
                 rotation_for_DA = (-180. / 360 * 2. * np.pi, 180. / 360 * 2. * np.pi)
             else:
                 rotation_for_DA = (-30. / 360 * 2. * np.pi, 30. / 360 * 2. * np.pi)
@@ -479,8 +481,6 @@ class nnUNetTrainer(object):
         else:
             raise RuntimeError()
 
-        # todo this function is stupid. It doesn't even use the correct scale range (we keep things as they were in the
-        #  old nnunet for now)
         initial_patch_size = get_patch_size(patch_size[-dim:],
                                             rotation_for_DA,
                                             rotation_for_DA,
@@ -493,6 +493,7 @@ class nnUNetTrainer(object):
         self.inference_allowed_mirroring_axes = mirror_axes
 
         return rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size, mirror_axes
+
 
     def print_to_log_file(self, *args, also_print_to_console=True, add_timestamp=True):
         if self.local_rank == 0:
@@ -654,72 +655,127 @@ class nnUNetTrainer(object):
         if self.dataset_class is None:
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
-        # we use the patch size to determine whether we need 2D or 3D dataloaders. We also use it to determine whether
-        # we need to use dummy 2D augmentation (in case of 3D training) and what our initial patch size should be
-        patch_size = self.configuration_manager.patch_size
+        # --- 数据集 ---
+        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
 
-        # needed for deep supervision: how much do we need to downscale the segmentation targets for the different
-        # outputs?
-        deep_supervision_scales = self._get_deep_supervision_scales()
+        # --- 根据 task_mode 选择 patch_size & deep supervision ---
+        if self.task_mode == 'cls_only':
+            # 只训练分类：用 cls_patch_size，deep supervision 对 cls 没意义，关掉即可
+            patch_size = self.cls_patch_size
+            deep_supervision_scales = None
+        else:
+            # seg_only / both：用 nnUNet 原始 patch_size + deep supervision
+            patch_size = self.configuration_manager.patch_size
+            deep_supervision_scales = self._get_deep_supervision_scales()
 
+        # --- DA 配置：注意这里用的是上面选好的 patch_size ---
         (
             rotation_for_DA,
             do_dummy_2d_data_aug,
             initial_patch_size,
             mirror_axes,
-        ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+        ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
 
-        # training pipeline
+        # --- 训练 / 验证 pipeline ---
         tr_transforms = self.get_training_transforms(
-            patch_size, rotation_for_DA, deep_supervision_scales, mirror_axes, do_dummy_2d_data_aug,
+            patch_size,                  # 👈 对 seg / cls 都用对应的 patch_size
+            rotation_for_DA,
+            deep_supervision_scales,
+            mirror_axes,
+            do_dummy_2d_data_aug,
             use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
-            is_cascaded=self.is_cascaded, foreground_labels=self.label_manager.foreground_labels,
+            is_cascaded=self.is_cascaded,
+            foreground_labels=self.label_manager.foreground_labels,
             regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-            ignore_label=self.label_manager.ignore_label)
+            ignore_label=self.label_manager.ignore_label
+        )
 
-        # validation pipeline
-        val_transforms = self.get_validation_transforms(deep_supervision_scales,
-                                                        is_cascaded=self.is_cascaded,
-                                                        foreground_labels=self.label_manager.foreground_labels,
-                                                        regions=self.label_manager.foreground_regions if
-                                                        self.label_manager.has_regions else None,
-                                                        ignore_label=self.label_manager.ignore_label)
+        val_transforms = self.get_validation_transforms(
+            deep_supervision_scales,
+            is_cascaded=self.is_cascaded,
+            foreground_labels=self.label_manager.foreground_labels,
+            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+            ignore_label=self.label_manager.ignore_label
+        )
 
-        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
+        # --- 构造 dataloader：根据 task_mode 控制 oversample 和 patch_size ---
+        if self.task_mode == 'cls_only':
+            # 🔹 分类专用：
+            #   - patch_size = cls_patch_size（大图中心裁剪 + pad）
+            #   - 不 oversample foreground（完整大图，不随机 bbox）
+            dl_tr = nnUNetDataLoader(
+                dataset_tr, self.batch_size,
+                patch_size,          # initial_patch_size
+                patch_size,          # final_patch_size
+                self.label_manager,
+                oversample_foreground_percent=0.0,
+                sampling_probabilities=None,
+                pad_sides=None,
+                transforms=tr_transforms,
+                probabilistic_oversampling=False
+            )
+            dl_val = nnUNetDataLoader(
+                dataset_val, self.batch_size,
+                patch_size,
+                patch_size,
+                self.label_manager,
+                oversample_foreground_percent=0.0,
+                sampling_probabilities=None,
+                pad_sides=None,
+                transforms=val_transforms,
+                probabilistic_oversampling=False
+            )
+        else:
+            # 🔹 seg_only / both：
+            #   - 用 nnUNet 原来的 random patch + oversampling，用的是 plans 里的 patch_size
+            dl_tr = nnUNetDataLoader(
+                dataset_tr, self.batch_size,
+                initial_patch_size,                      # 注意这里仍然用 initial_patch_size
+                self.configuration_manager.patch_size,   # 最终给网络的 patch_size
+                self.label_manager,
+                oversample_foreground_percent=self.oversample_foreground_percent,
+                sampling_probabilities=None,
+                pad_sides=None,
+                transforms=tr_transforms,
+                probabilistic_oversampling=self.probabilistic_oversampling
+            )
+            dl_val = nnUNetDataLoader(
+                dataset_val, self.batch_size,
+                self.configuration_manager.patch_size,
+                self.configuration_manager.patch_size,
+                self.label_manager,
+                oversample_foreground_percent=self.oversample_foreground_percent,
+                sampling_probabilities=None,
+                pad_sides=None,
+                transforms=val_transforms,
+                probabilistic_oversampling=self.probabilistic_oversampling
+            )
 
-        dl_tr = nnUNetDataLoader(dataset_tr, self.batch_size,
-                                 initial_patch_size,
-                                 self.configuration_manager.patch_size,
-                                 self.label_manager,
-                                 oversample_foreground_percent=self.oversample_foreground_percent,
-                                 sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
-                                 probabilistic_oversampling=self.probabilistic_oversampling)
-        dl_val = nnUNetDataLoader(dataset_val, self.batch_size,
-                                  self.configuration_manager.patch_size,
-                                  self.configuration_manager.patch_size,
-                                  self.label_manager,
-                                  oversample_foreground_percent=self.oversample_foreground_percent,
-                                  sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
-                                  probabilistic_oversampling=self.probabilistic_oversampling)
-
+        # --- 多线程 wrapper 保持不变 ---
         allowed_num_processes = get_allowed_n_proc_DA()
         if allowed_num_processes == 0:
             mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
             mt_gen_val = SingleThreadedAugmenter(dl_val, None)
         else:
-            mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
-                                                        num_processes=allowed_num_processes,
-                                                        num_cached=max(6, allowed_num_processes // 2), seeds=None,
-                                                        pin_memory=self.device.type == 'cuda', wait_time=0.002)
-            mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
-                                                      transform=None, num_processes=max(1, allowed_num_processes // 2),
-                                                      num_cached=max(3, allowed_num_processes // 4), seeds=None,
-                                                      pin_memory=self.device.type == 'cuda',
-                                                      wait_time=0.002)
-        # # let's get this party started
+            mt_gen_train = NonDetMultiThreadedAugmenter(
+                data_loader=dl_tr, transform=None,
+                num_processes=allowed_num_processes,
+                num_cached=max(6, allowed_num_processes // 2), seeds=None,
+                pin_memory=self.device.type == 'cuda', wait_time=0.002
+            )
+            mt_gen_val = NonDetMultiThreadedAugmenter(
+                data_loader=dl_val, transform=None,
+                num_processes=max(1, allowed_num_processes // 2),
+                num_cached=max(3, allowed_num_processes // 4), seeds=None,
+                pin_memory=self.device.type == 'cuda',
+                wait_time=0.002
+            )
+
+        # 预热一下
         _ = next(mt_gen_train)
         _ = next(mt_gen_val)
         return mt_gen_train, mt_gen_val
+
 
     @staticmethod
     def get_training_transforms(
