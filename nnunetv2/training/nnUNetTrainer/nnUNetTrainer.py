@@ -157,6 +157,8 @@ class nnUNetTrainer(object):
         self.num_epochs = 1000
         self.current_epoch = 0
         self.enable_deep_supervision = False
+        # ('both', 'seg_only', 'cls_only')
+        self.task_mode = 'seg_only'
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -217,7 +219,8 @@ class nnUNetTrainer(object):
                 self.configuration_manager.network_arch_init_kwargs_req_import,
                 self.num_input_channels,
                 self.label_manager.num_segmentation_heads,
-                self.enable_deep_supervision
+                self.enable_deep_supervision,
+                task_mode=self.task_mode
             ).to(self.device)
             # compile network for free speedup
             if self._do_i_compile():
@@ -325,8 +328,10 @@ class nnUNetTrainer(object):
                                      arch_init_kwargs: dict,
                                      arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
                                      num_input_channels: int,
-                                     num_output_channels: int,  # 这是分割头的通道数
-                                     enable_deep_supervision: bool = True) -> nn.Module:
+                                     num_output_channels: int,
+                                     task_mode: str,
+                                     enable_deep_supervision: bool = True
+                                     ) -> nn.Module:
         """
         此方法被重写，以直接加载自定义的 ResNet_MTL_nnUNet 模型，
         模仿 nnXNetTrainer 的方式。
@@ -350,6 +355,7 @@ class nnUNetTrainer(object):
             num_classes=num_output_channels,  # 分割头的类别数
             deep_supervision=enable_deep_supervision,
             cls_num_classes=3,
+            task_mode=task_mode,
             **architecture_kwargs  # 解包所有来自 plans 文件的参数
                                      # (例如 n_stages, features_per_stage, block, cls_num_classes 等)
         )
@@ -1047,12 +1053,12 @@ class nnUNetTrainer(object):
     def train_step(self, batch: dict) -> dict:
         """
         多任务单步训练：
-        - segmentation: DC+CE (+ Deep Supervision) → self.seg_loss
-        - classification: weighted CrossEntropy → self.cls_loss
-        - 总损失: L = lambda_seg * L_seg + lambda_cls * L_cls
+        - task_mode = 'seg_only' : 只训练 segmentation，cls 头前向但不产生梯度（在模型里控制）
+        - task_mode = 'cls_only' : 只训练 classification，encoder+decoder 不反传梯度（在模型里控制）
+        - task_mode = 'both'     : seg + cls 一起训（共享 encoder，按 lambda_seg / lambda_cls 加权）
         """
         data = batch['data']
-        target_seg = batch['target']       # deep supervision 时为 list，否则为 (B, D, H, W)
+        target_seg = batch['target']       # deep supervision 时为 list
         target_cls = batch['class_label']  # (B,)
 
         data = data.to(self.device, non_blocking=True)
@@ -1065,36 +1071,57 @@ class nnUNetTrainer(object):
 
         self.optimizer.zero_grad(set_to_none=True)
 
+        mode = self.task_mode  # 当前训练模式：'seg_only' / 'cls_only' / 'both'
+
         # Mixed precision on CUDA
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             # 网络返回 (seg_output, cls_output)
+            # task_mode 的具体梯度逻辑在模型内部处理
             output_seg, output_cls = self.network(data)
-            if self.current_epoch < 20:
-                self.lambda_seg = 0.3
-                self.lambda_cls = 1.0
-            else:
-                self.lambda_seg = 0.2
-                self.lambda_cls = 1.0
-            # seg_loss 内部已经处理 deep supervision（DeepSupervisionWrapper）
-            l_seg = self.seg_loss(output_seg, target_seg)
-            # 先拿最高分辨率的 target，用于判断是否有肿瘤
-            if isinstance(target_seg, list):
-                seg_hires = target_seg[0]     # (B, D, H, W)
-            else:
-                seg_hires = target_seg        # (B, D, H, W)
 
-            # 假设肿瘤 label = 2（自己按实际改），也可以简单用 >0
-            lesion_mask  = (seg_hires > 0)
-            # [B, D, H, W] -> [B, (D*H*W)] -> [B]
-            has_lesion = lesion_mask.view(lesion_mask.shape[0], -1).any(dim=1)   # (B,) bool
+            if mode == 'seg_only':
+                # 只训 seg：cls 分支在模型里已经 no_grad，这里 loss 置 0 就好
+                self.lambda_seg, self.lambda_cls = 1.0, 0.0
+                l_seg = self.seg_loss(output_seg, target_seg)
+                l_cls = torch.zeros(1, device=self.device, dtype=l_seg.dtype)
+                l = l_seg
 
-            if has_lesion.any():
-                l_cls = self.cls_loss(output_cls[has_lesion], target_cls[has_lesion])
-            else:
-                # 没有任何 lesion patch，就不给 cls 梯度
-                l_cls = 0.0 * output_cls.sum()
+            elif mode == 'cls_only':
+                # 只训 cls：模型里已经保证 encoder/decoder 不反传梯度
+                self.lambda_seg, self.lambda_cls = 0.0, 1.0
+                l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
+                l_cls = self.cls_loss(output_cls, target_cls)
+                l = l_cls
 
-            l = self.lambda_seg * l_seg + self.lambda_cls * l_cls
+            else:  # mode == 'both'
+                # seg + cls 一起训，保持你之前的实现（早期多给一点 cls）
+                if self.current_epoch < 20:
+                    self.lambda_seg = 0.3
+                    self.lambda_cls = 1.0
+                else:
+                    self.lambda_seg = 0.2
+                    self.lambda_cls = 1.0
+
+                # seg_loss 内部已经处理 deep supervision（DeepSupervisionWrapper）
+                l_seg = self.seg_loss(output_seg, target_seg)
+
+                # 先拿最高分辨率的 target，用于判断是否有肿瘤
+                if isinstance(target_seg, list):
+                    seg_hires = target_seg[0]     # (B, D, H, W)
+                else:
+                    seg_hires = target_seg        # (B, D, H, W)
+
+                # 简单假设：>0 就算 lesion
+                lesion_mask  = (seg_hires > 0)
+                has_lesion = lesion_mask.view(lesion_mask.shape[0], -1).any(dim=1)   # (B,) bool
+
+                if has_lesion.any():
+                    l_cls = self.cls_loss(output_cls[has_lesion], target_cls[has_lesion])
+                else:
+                    # 没有任何 lesion patch，就不给 cls 梯度
+                    l_cls = 0.0 * output_cls.sum()
+
+                l = self.lambda_seg * l_seg + self.lambda_cls * l_cls
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1108,10 +1135,11 @@ class nnUNetTrainer(object):
             self.optimizer.step()
 
         return {
-            'loss': l.detach().cpu().numpy(),         # 总损失
-            'loss_seg': l_seg.detach().cpu().numpy(), # 仅分割损失
-            'loss_cls': l_cls.detach().cpu().numpy()  # 仅分类损失
+            'loss': l.detach().cpu().numpy(),         # 总损失（取决于 task_mode）
+            'loss_seg': l_seg.detach().cpu().numpy(), # seg 损失（seg_only/ both 有意义）
+            'loss_cls': l_cls.detach().cpu().numpy()  # cls 损失（cls_only/ both 有意义）
         }
+
 
     
     def on_train_epoch_end(self, train_outputs: List[dict]):
@@ -1167,10 +1195,16 @@ class nnUNetTrainer(object):
             output_seg, output_cls = self.network(data)
             del data
             
-            # 4. 修改：计算多任务损失
             l_seg = self.seg_loss(output_seg, target_seg)
             l_cls = self.cls_loss(output_cls, target_cls)
-            l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
+
+            mode = self.task_mode
+            if mode == 'seg_only':
+                l = l_seg
+            elif mode == 'cls_only':
+                l = l_cls
+            else:
+                l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
 
         # --- 以下是分割指标计算 (使用 output_seg 和 target_seg) ---
 
