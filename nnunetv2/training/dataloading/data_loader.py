@@ -276,8 +276,8 @@ class nnUNetDataLoader(DataLoader):
                         images.append(tmp['image'])
                         segs.append(tmp['segmentation'])
                     data_all = torch.stack(images)
-                    if isinstance(segs, list):
-                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs))]
+                    if isinstance(segs[0], list):
+                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
                     else:
                         seg_all = torch.stack(segs)
                     del segs, images

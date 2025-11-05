@@ -7,7 +7,7 @@ import warnings
 from copy import deepcopy
 from datetime import datetime
 from time import time, sleep
-from typing import Tuple, Union, List
+from typing import Counter, Tuple, Union, List
 
 import numpy as np
 import torch
@@ -154,9 +154,9 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 100
+        self.num_epochs = 1000
         self.current_epoch = 0
-        self.enable_deep_supervision = True
+        self.enable_deep_supervision = False
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -168,10 +168,6 @@ class nnUNetTrainer(object):
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
         self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
-        # 假设在 initialize() 中
-        self.lambda_seg = 0 # 分割损失的权重
-        self.lambda_cls = 0 # 分类损失的权重 (示例)
-        self.cls_loss = None
         ### Simple logging. Don't take that away from me!
         # initialize log file. This is just our log for the print statements etc. Not to be confused with lightning
         # logging
@@ -246,6 +242,17 @@ class nnUNetTrainer(object):
             # if self._do_i_compile():
             #     self.loss = torch.compile(self.loss)
             self.was_initialized = True
+            # debug
+            # names_with_optim = set()
+            # for group in self.optimizer.param_groups:
+            #     for p in group['params']:
+            #         for name, p2 in self.network.named_parameters():
+            #             if p2 is p:
+            #                 names_with_optim.add(name)
+            #                 break
+
+            # print('classification_head in optimizer?:', any('classification_head' in n for n in names_with_optim))
+            # end debug
         else:
             raise RuntimeError("You have called self.initialize even though the trainer was already initialized. "
                                "That should not happen.")
@@ -312,41 +319,6 @@ class nnUNetTrainer(object):
             dct['torch_version'] = torch_version
             dct['cudnn_version'] = cudnn_version
             save_json(dct, join(self.output_folder, "debug.json"))
-
-    # @staticmethod
-    # def build_network_architecture(architecture_class_name: str,
-    #                                arch_init_kwargs: dict,
-    #                                arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
-    #                                num_input_channels: int,
-    #                                num_output_channels: int,
-    #                                enable_deep_supervision: bool = True) -> nn.Module:
-    #     """
-    #     This is where you build the architecture according to the plans. There is no obligation to use
-    #     get_network_from_plans, this is just a utility we use for the nnU-Net default architectures. You can do what
-    #     you want. Even ignore the plans and just return something static (as long as it can process the requested
-    #     patch size)
-    #     but don't bug us with your bugs arising from fiddling with this :-P
-    #     This is the function that is called in inference as well! This is needed so that all network architecture
-    #     variants can be loaded at inference time (inference will use the same nnUNetTrainer that was used for
-    #     training, so if you change the network architecture during training by deriving a new trainer class then
-    #     inference will know about it).
-
-    #     If you need to know how many segmentation outputs your custom architecture needs to have, use the following snippet:
-    #     > label_manager = plans_manager.get_label_manager(dataset_json)
-    #     > label_manager.num_segmentation_heads
-    #     (why so complicated? -> We can have either classical training (classes) or regions. If we have regions,
-    #     the number of outputs is != the number of classes. Also there is the ignore label for which no output
-    #     should be generated. label_manager takes care of all that for you.)
-
-    #     """
-    #     return get_network_from_plans(
-    #         architecture_class_name,
-    #         arch_init_kwargs,
-    #         arch_init_kwargs_req_import,
-    #         num_input_channels,
-    #         num_output_channels,
-    #         allow_init=True,
-    #         deep_supervision=enable_deep_supervision)
 
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
@@ -554,6 +526,7 @@ class nnUNetTrainer(object):
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
     def configure_optimizers(self):
+
         optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True)
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
@@ -952,54 +925,48 @@ class nnUNetTrainer(object):
 
         self.print_to_log_file("Calculating class weights for imbalanced classification task...")
         
-        # 1. 正确访问 nnUNetDataset
-        #    路径是: NonDetMultiThreadedAugmenter -> nnUNetDataLoader -> nnUNetDataset
         if self.tr_keys is None:
-             raise RuntimeError("self.tr_keys was not set in get_tr_and_val_datasets. This should not happen.")
+            raise RuntimeError("self.tr_keys was not set in get_tr_and_val_datasets. This should not happen.")
         tr_keys = self.tr_keys
-        
-        # 2. 解析 'keys' 以获取标签 (假设格式为 'quiz_LABEL_...')
+
+        # 2. 解析 subtype 标签: 假设 identifier 形如 'quiz_0_041' → subtype = 0/1/2
         try:
-            # 标签是整数 (0, 1, 2, ...)
             tr_labels = [int(k.split('_')[1]) for k in tr_keys]
         except Exception as e:
             self.print_to_log_file(f"!!! WARNING: Could not parse labels from training keys for weighted loss.")
-            self.print_to_log_file(f"!!! Make sure filenames follow the 'quiz_LABEL_...' format.")
-            self.print_to_log_file(f"!!! Using UNWEIGHTED classification loss. Error: {e}")
+            self.print_to_log_file(f"!!! Expect identifier like 'quiz_0_041'. Using UNWEIGHTED cls loss. Error: {e}")
             tr_labels = None
 
         if tr_labels is not None:
-            # 3. 获取分类头的类别总数
+            # 3. 从网络拿到分类头输出类别数
             if self.is_ddp:
                 net = self.network.module
             else:
                 net = self.network
-            
+
             try:
-                # 假设你的MLP是 nn.Sequential(..., nn.Linear(in, out))
                 num_classes = net.classification_head[-1].out_features
             except Exception as e:
-                self.print_to_log_file(f"!!! WARNING: Could not determine num_classes from network: {e}")
-                self.print_to_log_file("!!! Using UNWEIGHTED classification loss.")
+                self.print_to_log_file(f"!!! WARNING: Could not determine num_classes from classification_head: {e}")
+                self.print_to_log_file("!!! Using UNWEIGHTED cls loss.")
                 num_classes = None
 
             if num_classes is not None:
-                # 4. 统计每个类别的样本数
                 counts = np.bincount(tr_labels, minlength=num_classes)
-                
+
                 if np.any(counts == 0):
-                    self.print_to_log_file(f"!!! WARNING: Classes {np.where(counts==0)[0]} have 0 samples in this training fold.")
-                    self.print_to_log_file("!!! Using UNWEIGHTED classification loss to avoid division by zero.")
+                    self.print_to_log_file(f"!!! WARNING: Classes {np.where(counts==0)[0]} have 0 samples in this fold.")
+                    self.print_to_log_file("!!! Using UNWEIGHTED cls loss to avoid division by zero.")
                 else:
-                    # 5. 计算权重
+                    # 4. 经典 class-balanced weight：n / (K * n_c)
                     n_samples = len(tr_labels)
                     weights = n_samples / (num_classes * counts)
-                    
-                    # 6. 将权重转换为张量并移动到GPU
+
                     class_weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
-                    
-                    # 7. ★★★ 覆盖 (Overwrite) 原有的损失函数 ★★★
+
+                    # 5. ★ 覆盖原有的 cls_loss，之后 train_step 统一用这个 ★
                     self.cls_loss = torch.nn.CrossEntropyLoss(weight=class_weights)
+
                     self.print_to_log_file(f"Successfully applied weighted CrossEntropyLoss.")
                     self.print_to_log_file(f"Class counts (this fold): {counts}")
                     self.print_to_log_file(f"Class weights (this fold): {weights}")
@@ -1076,41 +1043,17 @@ class nnUNetTrainer(object):
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
 
-    # def train_step(self, batch: dict) -> dict:
-    #     data = batch['data']
-    #     target = batch['target']
 
-    #     data = data.to(self.device, non_blocking=True)
-    #     if isinstance(target, list):
-    #         target = [i.to(self.device, non_blocking=True) for i in target]
-    #     else:
-    #         target = target.to(self.device, non_blocking=True)
-
-    #     self.optimizer.zero_grad(set_to_none=True)
-    #     # Autocast can be annoying
-    #     # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
-    #     # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
-    #     # So autocast will only be active if we have a cuda device.
-    #     with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-    #         output = self.network(data)
-    #         # del data
-    #         l = self.loss(output, target)
-
-    #     if self.grad_scaler is not None:
-    #         self.grad_scaler.scale(l).backward()
-    #         self.grad_scaler.unscale_(self.optimizer)
-    #         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-    #         self.grad_scaler.step(self.optimizer)
-    #         self.grad_scaler.update()
-    #     else:
-    #         l.backward()
-    #         torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-    #         self.optimizer.step()
-    #     return {'loss': l.detach().cpu().numpy()}
     def train_step(self, batch: dict) -> dict:
+        """
+        多任务单步训练：
+        - segmentation: DC+CE (+ Deep Supervision) → self.seg_loss
+        - classification: weighted CrossEntropy → self.cls_loss
+        - 总损失: L = lambda_seg * L_seg + lambda_cls * L_cls
+        """
         data = batch['data']
-        target_seg = batch['target']
-        target_cls = batch['class_label']
+        target_seg = batch['target']       # deep supervision 时为 list，否则为 (B, D, H, W)
+        target_cls = batch['class_label']  # (B,)
 
         data = data.to(self.device, non_blocking=True)
         target_cls = target_cls.to(self.device, non_blocking=True)
@@ -1121,24 +1064,37 @@ class nnUNetTrainer(object):
             target_seg = target_seg.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
-        # Autocast can be annoying
-        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
-        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
-        # So autocast will only be active if we have a cuda device.
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            #Assume the network returns a tuple of (segmentation_output, classification_output)
-            output_seg, output_cls = self.network(data)
-            
-            self.lambda_seg = 0.0 # 分割损失的权重
-            self.lambda_cls = 1 # 分类损失的权重 
 
+        # Mixed precision on CUDA
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            # 网络返回 (seg_output, cls_output)
+            output_seg, output_cls = self.network(data)
+            if self.current_epoch < 20:
+                self.lambda_seg = 0.3
+                self.lambda_cls = 1.0
+            else:
+                self.lambda_seg = 0.2
+                self.lambda_cls = 1.0
+            # seg_loss 内部已经处理 deep supervision（DeepSupervisionWrapper）
             l_seg = self.seg_loss(output_seg, target_seg)
-            l_cls = self.cls_loss(output_cls, target_cls)
+            # 先拿最高分辨率的 target，用于判断是否有肿瘤
+            if isinstance(target_seg, list):
+                seg_hires = target_seg[0]     # (B, D, H, W)
+            else:
+                seg_hires = target_seg        # (B, D, H, W)
+
+            # 假设肿瘤 label = 2（自己按实际改），也可以简单用 >0
+            lesion_mask  = (seg_hires > 0)
+            # [B, D, H, W] -> [B, (D*H*W)] -> [B]
+            has_lesion = lesion_mask.view(lesion_mask.shape[0], -1).any(dim=1)   # (B,) bool
+
+            if has_lesion.any():
+                l_cls = self.cls_loss(output_cls[has_lesion], target_cls[has_lesion])
+            else:
+                # 没有任何 lesion patch，就不给 cls 梯度
+                l_cls = 0.0 * output_cls.sum()
 
             l = self.lambda_seg * l_seg + self.lambda_cls * l_cls
-
-            # (c) 总损失现在是两个独立部分的和
-            # l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1150,11 +1106,13 @@ class nnUNetTrainer(object):
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
+
         return {
-                'loss': l.detach().cpu().numpy(),         # 总损失
-                'loss_seg': l_seg.detach().cpu().numpy(), # 仅分割损失
-                'loss_cls': l_cls.detach().cpu().numpy()  # 仅分类损失
-               }
+            'loss': l.detach().cpu().numpy(),         # 总损失
+            'loss_seg': l_seg.detach().cpu().numpy(), # 仅分割损失
+            'loss_cls': l_cls.detach().cpu().numpy()  # 仅分类损失
+        }
+
     
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1645,6 +1603,11 @@ class nnUNetTrainer(object):
 
     def run_training(self):
         self.on_train_start()
+        # debug: 打印训练集中每个分类标签的样本数量
+        # from collections import Counter
+        # labels = [int(k.split('_')[1]) for k in self.tr_keys]
+        # print('label counts:', Counter(labels))
+
 
         for epoch in range(self.current_epoch, self.num_epochs):
             self.on_epoch_start()
