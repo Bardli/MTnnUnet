@@ -116,7 +116,7 @@ class ResNet_MTL_nnUNet(nn.Module):
         cls_num_heads: int = 4,
 
         # 任务模式
-        task_mode: str = 'both',
+        task_mode: str = 'cls_only',
     ):
         super().__init__()
 
