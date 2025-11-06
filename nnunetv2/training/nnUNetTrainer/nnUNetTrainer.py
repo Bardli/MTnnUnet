@@ -148,7 +148,8 @@ class nnUNetTrainer(object):
                 if self.is_cascaded else None
 
         ### Some hyperparameters for you to fiddle with
-        self.initial_lr = 1e-2
+        # self.initial_lr = 1e-2
+        self.initial_lr = 3e-2
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.probabilistic_oversampling = False
@@ -158,8 +159,8 @@ class nnUNetTrainer(object):
         self.current_epoch = 0
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
-        self.task_mode = 'seg_only'
-        self.cls_patch_size = (78, 146, 214)
+        self.task_mode = 'cls_only'
+        self.cls_patch_size = (96, 160, 224)
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -1251,16 +1252,21 @@ class nnUNetTrainer(object):
             output_seg, output_cls = self.network(data)
             del data
             
-            l_seg = self.seg_loss(output_seg, target_seg)
-            l_cls = self.cls_loss(output_cls, target_cls)
-
-            mode = self.task_mode
-            if mode == 'seg_only':
-                l = l_seg
-            elif mode == 'cls_only':
+            mode = self.task_mode  # Get mode first
+            
+            if mode == 'cls_only':
+                # If we only care about classification, seg_loss is not needed and target_seg is not a list
+                l_seg = torch.zeros(1, device=self.device, dtype=torch.float32) # Placeholder
+                l_cls = self.cls_loss(output_cls, target_cls)
                 l = l_cls
             else:
-                l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
+                # seg_only or both mode
+                l_seg = self.seg_loss(output_seg, target_seg) # This is now safe
+                l_cls = self.cls_loss(output_cls, target_cls)
+                if mode == 'seg_only':
+                    l = l_seg
+                else: # mode == 'both'
+                    l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
 
         # --- 以下是分割指标计算 (使用 output_seg 和 target_seg) ---
 
@@ -1724,6 +1730,8 @@ class nnUNetTrainer(object):
 # nnUNetv2_plan_and_preprocess -d 002 -pl nnUNetPlannerResEncM
 # train
 # nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans 
+# train cls
+# nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans -pretrained_weights F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\bestsig\20251105_bestseg.pth
 
 # predict
 # nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 5
