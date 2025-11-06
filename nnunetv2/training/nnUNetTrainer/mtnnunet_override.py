@@ -478,7 +478,7 @@ class nnUNetTrainerResEncMMTL(_BaseTrainer):
         # Classification loss will be initialised in on_train_start
         self.cls_loss = torch.nn.CrossEntropyLoss()
         self.logger = nnUNetLoggerMT()
-
+    
     # We override build_network_architecture to ensure our model is created
     @staticmethod
     def build_network_architecture(
