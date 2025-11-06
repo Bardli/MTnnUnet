@@ -243,6 +243,47 @@ class nnUNetPlannerResEncM(ResEncUNetPlanner):
         self.UNet_reference_val_2d = 135000000
         self.max_dataset_covered = 1
 
+class nnUNetPlannerResEncM_MTL(nnUNetPlannerResEncM):
+    """
+    Plan for the multi‑task ResNet‑M network.
+
+    This planner behaves identically to the standard ``nnUNetPlannerResEncM``
+    except that it instructs nnUNet to instantiate our multi‑task network
+    instead of the default ResidualEncoderUNet.  It also injects the
+    ``cls_num_classes`` and ``task_mode`` arguments into the architecture
+    dictionary so they are available when the network is built.
+    """
+
+    def get_plans_for_configuration(
+        self,
+        spacing: Union[np.ndarray, Tuple[float, ...], List[float]],
+        median_shape: Union[np.ndarray, Tuple[int, ...]],
+        data_identifier: str,
+        approximate_n_voxels_dataset: float,
+        _cache: dict,
+    ) -> dict:
+        # First call the parent to produce a baseline plan
+        plan = super().get_plans_for_configuration(
+            spacing, median_shape, data_identifier, approximate_n_voxels_dataset, _cache
+        )
+        # Now override the network class and add classification specifics
+        arch = plan['architecture']
+        # Replace the class name with our implementation
+        arch['network_class_name'] = (
+            f"{__name__}.ResNet_MTL_nnUNet"
+        )
+        # Insert classification parameters.  We set cls_num_classes to 3
+        # (subtypes 0/1/2) and default task_mode to 'both' so both heads are
+        # trained concurrently.  Additional kwargs can be specified by editing
+        # this dictionary.
+        arch['arch_kwargs']['cls_num_classes'] = 3
+        arch['arch_kwargs']['task_mode'] = 'both'
+        # Ensure PyTorch can resolve our network class at runtime.  These
+        # imported names require dynamic import via pydoc.locate when the
+        # trainer constructs the network.
+        if 'nonlin' not in arch['_kw_requires_import']:
+            arch['_kw_requires_import'] = (*arch['_kw_requires_import'], 'nonlin')
+        return plan
 
 class nnUNetPlannerResEncL(ResEncUNetPlanner):
     """
