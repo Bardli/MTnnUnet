@@ -68,6 +68,9 @@ from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 # import my model
 from nnunetv2.training.nnUNetTrainer.variants.network_architecture.ResNet_MTL_nnUNet import ResNet_MTL_nnUNet
+from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
+# Add these two if they are missing
+from nnunetv2.training.lr_scheduler.warmup import Lin_incr_LRScheduler, PolyLRScheduler_offset
 
 # compute validation score
 from sklearn.metrics import f1_score, accuracy_score
@@ -159,6 +162,7 @@ class nnUNetTrainer(object):
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
         self.task_mode = 'cls_only'
+        print(f"Task mode set to {self.task_mode}")
         self.cls_patch_size = (96, 160, 224)
 
         ### Dealing with labels/regions
@@ -533,10 +537,24 @@ class nnUNetTrainer(object):
             self.print_to_log_file('These are the global plan.json settings:\n', dct, '\n', add_timestamp=False)
 
     def configure_optimizers(self):
-
-        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
-                                    momentum=0.99, nesterov=True)
-        lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
+        
+        # ⭐️ 关键改动：根据 task_mode 选择 scheduler ⭐️
+        if self.task_mode == 'cls_only':
+            self.print_to_log_file("Using CLS_ONLY mode: Optimizer=SGD, LR_Scheduler=CosineAnnealingLR")
+            # 优化器（可以保持 SGD，或者换成 AdamW）
+            optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
+                                        momentum=0.99, nesterov=True)
+            # 调度器（使用 Cosine）
+            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.num_epochs)
+        
+        else: # 'seg_only' or 'both'
+            self.print_to_log_file(f"Using {self.task_mode.upper()} mode: Optimizer=SGD, LR_Scheduler=PolyLRScheduler")
+            # 优化器（保持 nnUNet 默认）
+            optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
+                                        momentum=0.99, nesterov=True)
+            # 调度器（保持 nnUNet 默认）
+            lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
+            
         return optimizer, lr_scheduler
 
     def plot_network_architecture(self):
@@ -655,63 +673,86 @@ class nnUNetTrainer(object):
         if self.dataset_class is None:
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
-        # --- 数据集 ---
         dataset_tr, dataset_val = self.get_tr_and_val_datasets()
 
         # --- 根据 task_mode 选择 patch_size & deep supervision ---
         if self.task_mode == 'cls_only':
-            # 只训练分类：用 cls_patch_size，deep supervision 对 cls 没意义，关掉即可
             patch_size = self.cls_patch_size
             deep_supervision_scales = None
-        else:
-            # seg_only / both：用 nnUNet 原始 patch_size + deep supervision
+            # ⭐️ 关键改动 (1/2): DA 和验证的 Transform
+            self.print_to_log_file("Using CLS_ONLY mode: Applying LIGHTWEIGHT data augmentation.")
+            (
+                rotation_for_DA,
+                do_dummy_2d_data_aug,
+                initial_patch_size, # cls 模式下这个没用，但要占位
+                mirror_axes,
+            ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
+            
+            # ⭐️ 关键改动 (2/2): 调用新的轻量级 DA
+            tr_transforms = self.get_cls_training_transforms( # 👈 调用新函数
+                patch_size,
+                rotation_for_DA,
+                deep_supervision_scales,
+                mirror_axes,
+                do_dummy_2d_data_aug,
+                use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+                is_cascaded=self.is_cascaded,
+                foreground_labels=self.label_manager.foreground_labels,
+                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+                ignore_label=self.label_manager.ignore_label
+            )
+            val_transforms = self.get_validation_transforms( # 验证集 DA 保持不变 (几乎没增强)
+                deep_supervision_scales,
+                is_cascaded=self.is_cascaded,
+                foreground_labels=self.label_manager.foreground_labels,
+                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+                ignore_label=self.label_manager.ignore_label
+            )
+            # --------------------------------------------------
+
+        else: # seg_only / both
             patch_size = self.configuration_manager.patch_size
             deep_supervision_scales = self._get_deep_supervision_scales()
+            
+            self.print_to_log_file("Using SEG/BOTH mode: Applying HEAVY data augmentation.")
+            (
+                rotation_for_DA,
+                do_dummy_2d_data_aug,
+                initial_patch_size, # 👈 seg 模式用这个
+                mirror_axes,
+            ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
 
-        # --- DA 配置：注意这里用的是上面选好的 patch_size ---
-        (
-            rotation_for_DA,
-            do_dummy_2d_data_aug,
-            initial_patch_size,
-            mirror_axes,
-        ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
+            tr_transforms = self.get_training_transforms( # 👈 调用原始的重度 DA
+                patch_size,
+                rotation_for_DA,
+                deep_supervision_scales,
+                mirror_axes,
+                do_dummy_2d_data_aug,
+                use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+                is_cascaded=self.is_cascaded,
+                foreground_labels=self.label_manager.foreground_labels,
+                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+                ignore_label=self.label_manager.ignore_label
+            )
+            val_transforms = self.get_validation_transforms(
+                deep_supervision_scales,
+                is_cascaded=self.is_cascaded,
+                foreground_labels=self.label_manager.foreground_labels,
+                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+                ignore_label=self.label_manager.ignore_label
+            )
 
-        # --- 训练 / 验证 pipeline ---
-        tr_transforms = self.get_training_transforms(
-            patch_size,                  # 👈 对 seg / cls 都用对应的 patch_size
-            rotation_for_DA,
-            deep_supervision_scales,
-            mirror_axes,
-            do_dummy_2d_data_aug,
-            use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
-            is_cascaded=self.is_cascaded,
-            foreground_labels=self.label_manager.foreground_labels,
-            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-            ignore_label=self.label_manager.ignore_label
-        )
-
-        val_transforms = self.get_validation_transforms(
-            deep_supervision_scales,
-            is_cascaded=self.is_cascaded,
-            foreground_labels=self.label_manager.foreground_labels,
-            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-            ignore_label=self.label_manager.ignore_label
-        )
-
-        # --- 构造 dataloader：根据 task_mode 控制 oversample 和 patch_size ---
+        # --- 构造 dataloader (这部分你改的很好，保持不变) ---
         if self.task_mode == 'cls_only':
-            # 🔹 分类专用：
-            #   - patch_size = cls_patch_size（大图中心裁剪 + pad）
-            #   - 不 oversample foreground（完整大图，不随机 bbox）
             dl_tr = nnUNetDataLoader(
                 dataset_tr, self.batch_size,
-                patch_size,          # initial_patch_size
-                patch_size,          # final_patch_size
+                patch_size,          # initial_patch_size (用 cls_patch_size)
+                patch_size,          # final_patch_size (用 cls_patch_size)
                 self.label_manager,
                 oversample_foreground_percent=0.0,
                 sampling_probabilities=None,
                 pad_sides=None,
-                transforms=tr_transforms,
+                transforms=tr_transforms, # 👈 使用上面选择的 tr_transforms
                 probabilistic_oversampling=False
             )
             dl_val = nnUNetDataLoader(
@@ -722,21 +763,19 @@ class nnUNetTrainer(object):
                 oversample_foreground_percent=0.0,
                 sampling_probabilities=None,
                 pad_sides=None,
-                transforms=val_transforms,
+                transforms=val_transforms, # 👈 使用上面选择的 val_transforms
                 probabilistic_oversampling=False
             )
         else:
-            # 🔹 seg_only / both：
-            #   - 用 nnUNet 原来的 random patch + oversampling，用的是 plans 里的 patch_size
             dl_tr = nnUNetDataLoader(
                 dataset_tr, self.batch_size,
-                initial_patch_size,                      # 注意这里仍然用 initial_patch_size
-                self.configuration_manager.patch_size,   # 最终给网络的 patch_size
+                initial_patch_size,                      # 👈 seg 模式用 initial_patch_size
+                self.configuration_manager.patch_size,   # 👈 seg 模式用 config 的 patch_size
                 self.label_manager,
                 oversample_foreground_percent=self.oversample_foreground_percent,
                 sampling_probabilities=None,
                 pad_sides=None,
-                transforms=tr_transforms,
+                transforms=tr_transforms, # 👈 使用上面选择的 tr_transforms
                 probabilistic_oversampling=self.probabilistic_oversampling
             )
             dl_val = nnUNetDataLoader(
@@ -747,12 +786,13 @@ class nnUNetTrainer(object):
                 oversample_foreground_percent=self.oversample_foreground_percent,
                 sampling_probabilities=None,
                 pad_sides=None,
-                transforms=val_transforms,
+                transforms=val_transforms, # 👈 使用上面选择的 val_transforms
                 probabilistic_oversampling=self.probabilistic_oversampling
             )
 
-        # --- 多线程 wrapper 保持不变 ---
+        # --- 多线程 wrapper (保持不变) ---
         allowed_num_processes = get_allowed_n_proc_DA()
+        # ... (这部分代码保持你原来的不变) ...
         if allowed_num_processes == 0:
             mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
             mt_gen_val = SingleThreadedAugmenter(dl_val, None)
@@ -771,7 +811,6 @@ class nnUNetTrainer(object):
                 wait_time=0.002
             )
 
-        # 预热一下
         _ = next(mt_gen_train)
         _ = next(mt_gen_val)
         return mt_gen_train, mt_gen_val
@@ -927,7 +966,109 @@ class nnUNetTrainer(object):
             transforms.append(DownsampleSegForDSTransform(ds_scales=deep_supervision_scales))
 
         return ComposeTransforms(transforms)
+    @staticmethod
+    def get_cls_training_transforms(
+            patch_size: Union[np.ndarray, Tuple[int]],
+            rotation_for_DA: RandomScalar,
+            deep_supervision_scales: Union[List, Tuple, None],
+            mirror_axes: Tuple[int, ...],
+            do_dummy_2d_data_aug: bool,
+            use_mask_for_norm: List[bool] = None,
+            is_cascaded: bool = False,
+            foreground_labels: Union[Tuple[int, ...], List[int]] = None,
+            regions: List[Union[List[int], Tuple[int, ...], int]] = None,
+            ignore_label: int = None,
+    ) -> BasicTransform:
+        """
+        为分类任务定制的轻量级数据增强
+        移除了 SpatialTransform, GaussianBlur, SimulateLowResolution, Mirroring
+        保留了色彩/强度增强
+        """
+        transforms = []
+        
+        # --- 伪 2D 逻辑 (如果需要，保持不变) ---
+        if do_dummy_2d_data_aug:
+            ignore_axes = (0,)
+            transforms.append(Convert3DTo2DTransform())
+            patch_size_spatial = patch_size[1:]
+        else:
+            patch_size_spatial = patch_size
+            ignore_axes = None
+            
+        # ！！！关键改动：移除或大幅减弱 SpatialTransform ！！！
+        # 我们可以保留一个非常温和的旋转，或者干脆去掉
+        # 示例：保留小角度旋转和缩放，去掉弹性形变
+        transforms.append(
+            SpatialTransform(
+                patch_size_spatial, patch_center_dist_from_border=0, random_crop=False, 
+                p_elastic_deform=0, # 关闭弹性形变
+                p_rotation=0.1,     # 降低旋转概率
+                rotation=(-15. / 360 * 2. * np.pi, 15. / 360 * 2. * np.pi), # 减小旋转角度
+                p_scaling=0.1,      # 降低缩放概率
+                scaling=(0.9, 1.1), # 减小缩放范围
+                p_synchronize_scaling_across_axes=1,
+                bg_style_seg_sampling=False
+            )
+        )
+        if do_dummy_2d_data_aug:
+            transforms.append(Convert2DTo3DTransform())
+        # ----------------------------------------------
+        
+        # --- 保留强度/噪声增强 ---
+        transforms.append(RandomTransform(
+            GaussianNoiseTransform(
+                noise_variance=(0, 0.05), # 也可以适当减弱噪声
+                p_per_channel=1,
+                synchronize_channels=True
+            ), apply_probability=0.1
+        ))
+        transforms.append(RandomTransform(
+            MultiplicativeBrightnessTransform(
+                multiplier_range=BGContrast((0.85, 1.15)), # 减弱亮度变化
+                synchronize_channels=False,
+                p_per_channel=1
+            ), apply_probability=0.15
+        ))
+        transforms.append(RandomTransform(
+            ContrastTransform(
+                contrast_range=BGContrast((0.85, 1.15)), # 减弱对比度变化
+                preserve_range=True,
+                synchronize_channels=False,
+                p_per_channel=1
+            ), apply_probability=0.15
+        ))
+        transforms.append(RandomTransform(
+            GammaTransform(
+                gamma=BGContrast((0.8, 1.2)), # 减弱 Gamma
+                p_invert_image=0,
+                synchronize_channels=False,
+                p_per_channel=1,
+                p_retain_stats=1
+            ), apply_probability=0.15
+        ))
+        # --- 移除 MirrorTransform ---
+        # if mirror_axes is not None and len(mirror_axes) > 0:
+        #     transforms.append(
+        #         MirrorTransform(
+        #             allowed_axes=mirror_axes
+        #         )
+        #     )
+        
+        # --- Masking 和 Label 转换 (保持不变) ---
+        if use_mask_for_norm is not None and any(use_mask_for_norm):
+            transforms.append(MaskImageTransform(
+                apply_to_channels=[i for i in range(len(use_mask_for_norm)) if use_mask_for_norm[i]],
+                channel_idx_in_seg=0,
+                set_outside_to=0,
+            ))
 
+        # --- 分类任务不需要这些 ---
+        # transforms.append(RemoveLabelTansform(-1, 0))
+        # if is_cascaded: ...
+        # if regions is not None: ...
+        # if deep_supervision_scales is not None: ...
+
+        return ComposeTransforms(transforms)
     @staticmethod
     def get_validation_transforms(
             deep_supervision_scales: Union[List, Tuple, None],
@@ -1097,7 +1238,13 @@ class nnUNetTrainer(object):
 
     def on_train_epoch_start(self):
         self.network.train()
-        self.lr_scheduler.step(self.current_epoch)
+        # self.lr_scheduler.step(self.current_epoch)
+        if isinstance(self.lr_scheduler, (PolyLRScheduler, Lin_incr_LRScheduler, PolyLRScheduler_offset)):
+            # These custom schedulers *do* expect the epoch
+            self.lr_scheduler.step(self.current_epoch)
+        else:
+            # Standard PyTorch schedulers (like CosineAnnealingLR) do not
+            self.lr_scheduler.step()
         self.print_to_log_file('')
         self.print_to_log_file(f'Epoch {self.current_epoch}')
         self.print_to_log_file(
