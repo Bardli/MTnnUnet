@@ -23,12 +23,12 @@ class nnUNetDataLoader(DataLoader):
                  patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
                  final_patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
                  label_manager: LabelManager,
+                 task_mode: str,  
                  oversample_foreground_percent: float = 0.0,
                  sampling_probabilities: Union[List[int], Tuple[int, ...], np.ndarray] = None,
                  pad_sides: Union[List[int], Tuple[int, ...]] = None,
                  probabilistic_oversampling: bool = False,
                  transforms=None,
-                 task_mode: str = 'seg',            # 'seg' or 'cls'
                  cls_patch_size: Union[List[int], Tuple[int, ...], np.ndarray, None] = None
                  ):
         """
@@ -38,7 +38,7 @@ class nnUNetDataLoader(DataLoader):
         super().__init__(data, batch_size, 1, None, True,
                          False, True, sampling_probabilities)
 
-        assert task_mode in ('seg', 'cls'), f"task_mode must be 'seg' or 'cls', got {task_mode}"
+        assert task_mode in ('seg_only', 'cls_only'), f"task_mode must be 'seg_only' or 'cls_only', got {task_mode}"
         self.task_mode = task_mode
 
         # 2D → 3D 伪 3D 处理
@@ -55,12 +55,12 @@ class nnUNetDataLoader(DataLoader):
         self.oversample_foreground_percent = oversample_foreground_percent
         self.final_patch_size = final_patch_size
         self.patch_size = np.array(patch_size).astype(int)
-
+        cls_patch_size = np.array([96, 160, 224], dtype=int)
         # cls 模式下使用单独的 patch size
-        if self.task_mode == 'cls':
+        if self.task_mode == 'cls_only':
             if cls_patch_size is None:
                 raise ValueError(
-                    "task_mode='cls' 时必须显式传入 cls_patch_size=(D, H, W)，"
+                    "task_mode='cls_only' 时必须显式传入 cls_patch_size=(D, H, W)，"
                     "你可以用前面的统计脚本拿到最大 ROI 尺寸后在这里硬编码。"
                 )
             cls_patch_size = np.array(cls_patch_size).astype(int)
@@ -101,7 +101,7 @@ class nnUNetDataLoader(DataLoader):
         data, seg, seg_prev, properties = self._data.load_case(self._data.identifiers[0])
         num_color_channels = data.shape[0]
 
-        if self.task_mode == 'cls' and self.cls_patch_size is not None:
+        if self.task_mode == 'cls_only' and self.cls_patch_size is not None:
             patch = self.cls_patch_size
         else:
             patch = self.patch_size
@@ -173,7 +173,7 @@ class nnUNetDataLoader(DataLoader):
         # =========================
         # CLS 模式：固定 cls_patch_size，中心对齐 + pad，不随机 crop
         # =========================
-        if self.task_mode == 'cls':
+        if self.task_mode == 'cls_only':
             data_all = np.zeros(self.data_shape, dtype=np.float32)
             class_labels_all = np.zeros(self.batch_size, dtype=np.int64)
 
@@ -228,6 +228,7 @@ class nnUNetDataLoader(DataLoader):
             return {
                 'data': data_all,              # [B, C, *cls_patch_size]
                 'class_label': class_labels_all,
+                'target': [],
                 'keys': selected_keys
             }
 

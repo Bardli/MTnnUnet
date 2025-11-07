@@ -749,6 +749,7 @@ class nnUNetTrainer(object):
                 patch_size,          # initial_patch_size (用 cls_patch_size)
                 patch_size,          # final_patch_size (用 cls_patch_size)
                 self.label_manager,
+                task_mode= self.task_mode,
                 oversample_foreground_percent=0.0,
                 sampling_probabilities=None,
                 pad_sides=None,
@@ -760,6 +761,7 @@ class nnUNetTrainer(object):
                 patch_size,
                 patch_size,
                 self.label_manager,
+                task_mode= self.task_mode,
                 oversample_foreground_percent=0.0,
                 sampling_probabilities=None,
                 pad_sides=None,
@@ -1380,99 +1382,106 @@ class nnUNetTrainer(object):
 
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
-        # 1. 修改：获取分割和分类的目标
-        target_seg = batch['target']
+        target_seg = batch.get('target', None)      # cls_only 里可能是 dummy
         target_cls = batch['class_label']
 
         data = data.to(self.device, non_blocking=True)
-        # 2. 修改：移动两个目标到设备
         target_cls = target_cls.to(self.device, non_blocking=True)
-        if isinstance(target_seg, list):
-            target_seg = [i.to(self.device, non_blocking=True) for i in target_seg]
-        else:
-            target_seg = target_seg.to(self.device, non_blocking=True)
 
-        # Autocast
+        mode = self.task_mode  # 当前模式
+
+        if mode != 'cls_only':
+            # 只有 seg/both 模式才需要把 seg 搬到 device
+            if isinstance(target_seg, list):
+                target_seg = [i.to(self.device, non_blocking=True) for i in target_seg]
+            else:
+                target_seg = target_seg.to(self.device, non_blocking=True)
+
+        # ---- forward ----
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            # 3. 修改：获取两个网络输出
             output_seg, output_cls = self.network(data)
             del data
-            
-            mode = self.task_mode  # Get mode first
-            
+
             if mode == 'cls_only':
-                # If we only care about classification, seg_loss is not needed and target_seg is not a list
-                l_seg = torch.zeros(1, device=self.device, dtype=torch.float32) # Placeholder
+                # 只关心分类
+                l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
                 l_cls = self.cls_loss(output_cls, target_cls)
                 l = l_cls
             else:
-                # seg_only or both mode
-                l_seg = self.seg_loss(output_seg, target_seg) # This is now safe
+                # seg_only 或 both
+                l_seg = self.seg_loss(output_seg, target_seg)
                 l_cls = self.cls_loss(output_cls, target_cls)
                 if mode == 'seg_only':
                     l = l_seg
-                else: # mode == 'both'
+                else:  # both
                     l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
 
-        # --- 以下是分割指标计算 (使用 output_seg 和 target_seg) ---
-
-        # 5. 修改：对分割输出应用深度监督逻辑
-        if self.enable_deep_supervision:
-            output_seg = output_seg[0]
-            target_seg = target_seg[0]
-
-        # 6. 修改：使用分割输出计算 axes
-        axes = [0] + list(range(2, output_seg.ndim))
-
-        # 7. 使用分割输出计算 one-hot 预测
-        if self.label_manager.has_regions:
-            predicted_segmentation_onehot = (torch.sigmoid(output_seg) > 0.5).long()
-        else:
-            # no need for softmax
-            output_seg_argmax = output_seg.argmax(1)[:, None]
-            predicted_segmentation_onehot = torch.zeros(output_seg.shape, device=output_seg.device, dtype=torch.float32)
-            predicted_segmentation_onehot.scatter_(1, output_seg_argmax, 1)
-            del output_seg_argmax
-
-        # 8. 修改：使用分割目标处理 ignore label
-        if self.label_manager.has_ignore_label:
-            if not self.label_manager.has_regions:
-                mask = (target_seg != self.label_manager.ignore_label).float()
-                # CAREFUL that you don't rely on target after this line!
-                target_seg[target_seg == self.label_manager.ignore_label] = 0
+        # =========================
+        # 分割指标：cls_only 直接跳过
+        # =========================
+        if mode == 'cls_only':
+            # 构造 0 占位，长度和前景类数一致
+            if self.label_manager.has_regions:
+                n_fg = len(self.label_manager.foreground_regions)
             else:
-                if target_seg.dtype == torch.bool:
-                    mask = ~target_seg[:, -1:]
-                else:
-                    mask = 1 - target_seg[:, -1:]
-                # CAREFUL that you don't rely on target after this line!
-                target_seg = target_seg[:, :-1]
+                n_fg = len(self.label_manager.foreground_labels)
+            tp_hard = np.zeros(n_fg, dtype=np.float64)
+            fp_hard = np.zeros(n_fg, dtype=np.float64)
+            fn_hard = np.zeros(n_fg, dtype=np.float64)
         else:
-            mask = None
+            # 原来的 seg 评估逻辑
+            if self.enable_deep_supervision:
+                output_seg = output_seg[0]
+                target_seg = target_seg[0]
 
-        # 9.使用分割目标计算 tp, fp, fn
-        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target_seg, axes=axes, mask=mask)
+            axes = [0] + list(range(2, output_seg.ndim))
 
-        tp_hard = tp.detach().cpu().numpy()
-        fp_hard = fp.detach().cpu().numpy()
-        fn_hard = fn.detach().cpu().numpy()
-        if not self.label_manager.has_regions:
-            # ... (原始逻辑保持不变)
-            tp_hard = tp_hard[1:]
-            fp_hard = fp_hard[1:]
-            fn_hard = fn_hard[1:]
+            if self.label_manager.has_regions:
+                predicted_segmentation_onehot = (torch.sigmoid(output_seg) > 0.5).long()
+            else:
+                output_seg_argmax = output_seg.argmax(1)[:, None]
+                predicted_segmentation_onehot = torch.zeros(
+                    output_seg.shape, device=output_seg.device, dtype=torch.float32
+                )
+                predicted_segmentation_onehot.scatter_(1, output_seg_argmax, 1)
+                del output_seg_argmax
 
-        # 10. 返回包含所有指标的字典
+            if self.label_manager.has_ignore_label:
+                if not self.label_manager.has_regions:
+                    mask = (target_seg != self.label_manager.ignore_label).float()
+                    target_seg[target_seg == self.label_manager.ignore_label] = 0
+                else:
+                    if target_seg.dtype == torch.bool:
+                        mask = ~target_seg[:, -1:]
+                    else:
+                        mask = 1 - target_seg[:, -1:]
+                    target_seg = target_seg[:, :-1]
+            else:
+                mask = None
+
+            tp, fp, fn, _ = get_tp_fp_fn_tn(
+                predicted_segmentation_onehot, target_seg, axes=axes, mask=mask
+            )
+
+            tp_hard = tp.detach().cpu().numpy()
+            fp_hard = fp.detach().cpu().numpy()
+            fn_hard = fn.detach().cpu().numpy()
+            if not self.label_manager.has_regions:
+                tp_hard = tp_hard[1:]
+                fp_hard = fp_hard[1:]
+                fn_hard = fn_hard[1:]
+
         return {
-            'loss': l.detach().cpu().numpy(),           # 总损失
-            'loss_seg': l_seg.detach().cpu().numpy(),   # 分割损失 (用于日志)
-            'loss_cls': l_cls.detach().cpu().numpy(),   # 分类损失 (用于日志)
-            'tp_hard': tp_hard,                       # 分割指标
+            'loss': l.detach().cpu().numpy(),
+            'loss_seg': l_seg.detach().cpu().numpy(),
+            'loss_cls': l_cls.detach().cpu().numpy(),
+            'tp_hard': tp_hard,
             'fp_hard': fp_hard,
             'fn_hard': fn_hard,
-            'cls_pred': output_cls.detach().cpu().numpy(), # 分类预测 (用于 AUC/Acc)
-            'cls_target': target_cls.detach().cpu().numpy() # 分类目标 (用于 AUC/Acc)
+            'cls_pred': output_cls.detach().cpu().numpy(),
+            'cls_target': target_cls.detach().cpu().numpy()
         }
+
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
@@ -1563,6 +1572,7 @@ class nnUNetTrainer(object):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
 
     def on_epoch_end(self):
+        self.debug_check_param("cls_adapter")
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
         # --- GAI: 打印所有训练和验证损失 ---
@@ -1842,6 +1852,72 @@ class nnUNetTrainer(object):
 
         self.set_deep_supervision_enabled(True)
         compute_gaussian.cache_clear()
+    def debug_check_param(self, layer_keyword: str = "classification_head"):
+        """
+        打印某一层参数的统计信息，并检查是否在更新 & 是否出现 NaN.
+        layer_keyword: 在 parameter name 里查找的关键字，比如 "classification_head" 或 "cls_adapter"
+        """
+        # 处理 DDP 情况
+        if self.is_ddp:
+            net = self.network.module
+        else:
+            net = self.network
+
+        # 找到第一个名字里包含 layer_keyword 的参数
+        for name, p in net.named_parameters():
+            if layer_keyword in name and p.requires_grad:
+                w = p.data
+                # 1) NaN 检查
+                has_nan = torch.isnan(w).any().item()
+
+                # 2) 基本统计量
+                w_mean = w.mean().item()
+                w_std  = w.std().item()
+                w_min  = w.min().item()
+                w_max  = w.max().item()
+
+                # 3) 更新幅度检查：和上一次保存的权重对比
+                key = f"_debug_prev_{layer_keyword}"
+                prev = getattr(self, key, None)
+                if prev is None:
+                    # 第一次调用：只存一份，不比较
+                    setattr(self, key, w.detach().clone())
+                    delta_mean = 0.0
+                    delta_max  = 0.0
+                else:
+                    diff = (w - prev).abs()
+                    delta_mean = diff.mean().item()
+                    delta_max  = diff.max().item()
+                    # 更新缓存
+                    setattr(self, key, w.detach().clone())
+                g = p.grad
+                if g is not None:
+                    g_has_nan = torch.isnan(g).any().item()
+                    g_mean = g.mean().item()
+                    g_std  = g.std().item()
+                else:
+                    g_has_nan = False
+                    g_mean = 0.0
+                    g_std  = 0.0
+
+                self.print_to_log_file(
+                    f"[DEBUG] Layer '{name}': "
+                    f"w_mean={w_mean:.4e}, w_std={w_std:.4e}, "
+                    f"w_min={w_min:.4e}, w_max={w_max:.4e}, "
+                    f"w_has_nan={has_nan}, "
+                    f"g_mean={g_mean:.4e}, g_std={g_std:.4e}, g_has_nan={g_has_nan}, "
+                    f"delta_mean={delta_mean:.4e}, delta_max={delta_max:.4e}"
+                )
+                self.print_to_log_file(
+                    f"[DEBUG] Layer '{name}': "
+                    f"mean={w_mean:.4e}, std={w_std:.4e}, "
+                    f"min={w_min:.4e}, max={w_max:.4e}, "
+                    f"has_nan={has_nan}, "
+                    f"delta_mean={delta_mean:.4e}, delta_max={delta_max:.4e}"
+                )
+                break
+        else:
+            self.print_to_log_file(f"[DEBUG] No parameter found with keyword '{layer_keyword}'")
 
     def run_training(self):
         self.on_train_start()

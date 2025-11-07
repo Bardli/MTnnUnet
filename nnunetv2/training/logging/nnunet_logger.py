@@ -62,120 +62,168 @@ class nnUNetLogger(object):
     def plot_progress_png(self, output_folder):
         """
         Renders plots for training monitoring.
-        This modified version plots:
-        1. Total Train/Val Loss + Mean FG Dice (Original Plot)
-        2. Seg/Cls Train/Val Losses
-        3. Validation Metrics (Dice, Accuracy, Macro F1)
-        4. Epoch Duration & Learning Rate
+        如果某个 key 没有日志或长度不够，就不画这条线（或者只画已有的部分），
+        不会再因为空 list / 长度不一致崩掉了。
         """
-        
-        # --- Robust Epoch Calculation ---
-        # We list all keys that are *supposed* to be logged every epoch.
-        # This prevents un-logged keys (like 'val_classification_targets') 
-        # from breaking the min() function and causing an empty plot.
+        # 这些 key 预期是“每个 epoch 都记一次”的核心指标
         core_logging_keys = [
             'train_losses', 'val_losses', 'mean_fg_dice', 'ema_fg_dice', 'lrs',
-            'epoch_start_timestamps', 'epoch_end_timestamps', 'train_loss_seg',
-            'train_loss_cls', 'val_loss_seg', 'val_loss_cls', 'val_macro_f1', 'val_accuracy'
+            'epoch_start_timestamps', 'epoch_end_timestamps',
+            'train_loss_seg', 'train_loss_cls',
+            'val_loss_seg', 'val_loss_cls',
+            'val_macro_f1', 'val_accuracy'
         ]
 
-        # Get lengths of all core logs that are actually present and have entries
+        # 统计实际有数据的长度
         logged_lengths = []
         for key in core_logging_keys:
-            if key in self.my_fantastic_logging and len(self.my_fantastic_logging[key]) > 0:
-                logged_lengths.append(len(self.my_fantastic_logging[key]))
+            vals = self.my_fantastic_logging.get(key, [])
+            if isinstance(vals, list) and len(vals) > 0:
+                logged_lengths.append(len(vals))
 
         if not logged_lengths:
-            # No logging data found, cannot plot.
             print("Warning: No logging data found to plot progress. Skipping plot generation.")
             return
 
-        # Determine the number of epochs to plot
-        epoch = min(logged_lengths) - 1  # lists of epoch 0 have len 1
+        # 所有曲线最多画到的 epoch
+        epoch = min(logged_lengths) - 1
         if epoch < 0:
-            # Not enough data to plot (e.g., only epoch 0 started but didn't finish)
             print("Warning: Not enough logging data to plot progress. Skipping plot generation.")
             return
 
-        x_values = list(range(epoch + 1))
+        def get_xy(key):
+            """
+            安全地取出某个 key 对应的 x/y：
+            - 如果没有数据，返回 (None, None) -> 不画；
+            - 如果长度 < epoch+1，只画已有的那一部分。
+            """
+            vals = self.my_fantastic_logging.get(key, None)
+            if vals is None or not isinstance(vals, list) or len(vals) == 0:
+                return None, None
+            max_len = min(len(vals), epoch + 1)
+            x = list(range(max_len))
+            y = vals[:max_len]
+            return x, y
 
-        # --- Setup Figure ---
+        import matplotlib
+        matplotlib.use('agg')
+        import seaborn as sns
+        import matplotlib.pyplot as plt
+        from batchgenerators.utilities.file_and_folder_operations import join
+
         sns.set(font_scale=2.5)
-        # We now need 4 subplots
-        fig, ax_all = plt.subplots(4, 1, figsize=(30, 68)) # Increased size for 4 plots
+        fig, ax_all = plt.subplots(4, 1, figsize=(30, 68))
 
-        # --- Plot 1: Total Loss and Pseudo Dice (Original) ---
+        # -------- Plot 1: Total Loss & Pseudo Dice --------
         ax = ax_all[0]
         ax.set_title("Total Loss and Pseudo Dice")
         ax2 = ax.twinx()
-        ax.plot(x_values, self.my_fantastic_logging['train_losses'][:epoch + 1], color='b', ls='-', label="loss_tr", linewidth=4)
-        ax.plot(x_values, self.my_fantastic_logging['val_losses'][:epoch + 1], color='r', ls='-', label="loss_val", linewidth=4)
-        ax2.plot(x_values, self.my_fantastic_logging['mean_fg_dice'][:epoch + 1], color='g', ls='dotted', label="pseudo dice",
-                linewidth=3)
-        ax2.plot(x_values, self.my_fantastic_logging['ema_fg_dice'][:epoch + 1], color='g', ls='-', label="pseudo dice (mov. avg.)",
-                linewidth=4)
+
+        x_tr, y_tr = get_xy('train_losses')
+        x_val, y_val = get_xy('val_losses')
+        x_dice, y_dice = get_xy('mean_fg_dice')
+        x_dice_ema, y_dice_ema = get_xy('ema_fg_dice')
+
+        if x_tr is not None:
+            ax.plot(x_tr, y_tr, color='b', ls='-', label="loss_tr", linewidth=4)
+        if x_val is not None:
+            ax.plot(x_val, y_val, color='r', ls='-', label="loss_val", linewidth=4)
+        if x_dice is not None:
+            ax2.plot(x_dice, y_dice, color='g', ls='dotted', label="pseudo dice", linewidth=3)
+        if x_dice_ema is not None:
+            ax2.plot(x_dice_ema, y_dice_ema, color='g', ls='-', label="pseudo dice (mov. avg.)", linewidth=4)
+
         ax.set_xlabel("epoch")
         ax.set_ylabel("Total Loss")
         ax2.set_ylabel("Pseudo Dice")
-        ax.legend(loc=(0.0, 1.01)) # Adjusted location
-        ax2.legend(loc=(0.25, 1.01)) # Adjusted location
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc=(0.0, 1.01))
+        if ax2.get_legend_handles_labels()[0]:
+            ax2.legend(loc=(0.25, 1.01))
 
-        # --- Plot 2: Segmentation and Classification Losses ---
+        # -------- Plot 2: Seg & Cls Losses --------
         ax = ax_all[1]
         ax.set_title("Component Losses (Seg vs. Cls)")
         ax2 = ax.twinx()
-        
-        # Plot Seg Losses
-        ax.plot(x_values, self.my_fantastic_logging['train_loss_seg'][:epoch + 1], color='b', ls='-', label="train_loss_seg", linewidth=4)
-        ax.plot(x_values, self.my_fantastic_logging['val_loss_seg'][:epoch + 1], color='r', ls='-', label="val_loss_seg", linewidth=4)
+
+        x_tr_seg, y_tr_seg = get_xy('train_loss_seg')
+        x_val_seg, y_val_seg = get_xy('val_loss_seg')
+        x_tr_cls, y_tr_cls = get_xy('train_loss_cls')
+        x_val_cls, y_val_cls = get_xy('val_loss_cls')
+
+        if x_tr_seg is not None:
+            ax.plot(x_tr_seg, y_tr_seg, color='b', ls='-', label="train_loss_seg", linewidth=4)
+        if x_val_seg is not None:
+            ax.plot(x_val_seg, y_val_seg, color='r', ls='-', label="val_loss_seg", linewidth=4)
         ax.set_xlabel("epoch")
         ax.set_ylabel("Segmentation Loss")
-        ax.legend(loc=(0.0, 1.01))
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc=(0.0, 1.01))
 
-        # Plot Cls Losses
-        ax2.plot(x_values, self.my_fantastic_logging['train_loss_cls'][:epoch + 1], color='b', ls='--', label="train_loss_cls", linewidth=4)
-        ax2.plot(x_values, self.my_fantastic_logging['val_loss_cls'][:epoch + 1], color='r', ls='--', label="val_loss_cls", linewidth=4)
+        if x_tr_cls is not None:
+            ax2.plot(x_tr_cls, y_tr_cls, color='b', ls='--', label="train_loss_cls", linewidth=4)
+        if x_val_cls is not None:
+            ax2.plot(x_val_cls, y_val_cls, color='r', ls='--', label="val_loss_cls", linewidth=4)
         ax2.set_ylabel("Classification Loss")
-        ax2.legend(loc=(0.25, 1.01))
+        if ax2.get_legend_handles_labels()[0]:
+            ax2.legend(loc=(0.25, 1.01))
 
-        # --- Plot 3: Validation Metrics (Dice, Acc, F1) ---
+        # -------- Plot 3: Val Metrics (Dice / Acc / F1) --------
         ax = ax_all[2]
         ax.set_title("Validation Metrics")
-        ax.plot(x_values, self.my_fantastic_logging['mean_fg_dice'][:epoch + 1], color='g', ls='-', label="Val Mean Dice", linewidth=4)
-        ax.plot(x_values, self.my_fantastic_logging['val_accuracy'][:epoch + 1], color='b', ls='-', label="Val Accuracy", linewidth=4)
-        ax.plot(x_values, self.my_fantastic_logging['val_macro_f1'][:epoch + 1], color='r', ls='-', label="Val Macro F1", linewidth=4)
+
+        x_dice, y_dice = get_xy('mean_fg_dice')
+        x_acc, y_acc = get_xy('val_accuracy')
+        x_f1, y_f1 = get_xy('val_macro_f1')
+
+        if x_dice is not None:
+            ax.plot(x_dice, y_dice, color='g', ls='-', label="Val Mean Dice", linewidth=4)
+        if x_acc is not None:
+            ax.plot(x_acc, y_acc, color='b', ls='-', label="Val Accuracy", linewidth=4)
+        if x_f1 is not None:
+            ax.plot(x_f1, y_f1, color='r', ls='-', label="Val Macro F1", linewidth=4)
+
         ax.set_xlabel("epoch")
         ax.set_ylabel("Metric")
-        ax.legend(loc=(0.0, 1.01))
-        ax.set_ylim(bottom=max(0, ax.get_ylim()[0]), top=min(1.05, ax.get_ylim()[1])) # Metrics are typically [0, 1]
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc=(0.0, 1.01))
+        # metrics 一般 [0,1]，做个裁剪
+        ymin, ymax = ax.get_ylim()
+        ax.set_ylim(bottom=max(0, ymin), top=min(1.05, ymax))
 
-        # --- Plot 4: Epoch Time and Learning Rate ---
+        # -------- Plot 4: Epoch Time & LR --------
         ax = ax_all[3]
         ax.set_title("System Stats")
         ax2 = ax.twinx()
 
-        # Plot Epoch Time
-        epoch_times = [i - j for i, j in zip(self.my_fantastic_logging['epoch_end_timestamps'][:epoch + 1],
-                                            self.my_fantastic_logging['epoch_start_timestamps'][:epoch + 1])]
-        ax.plot(x_values, epoch_times, color='b', ls='-', label="epoch duration", linewidth=4)
-        ylim = [0] + [ax.get_ylim()[1]]
-        ax.set(ylim=ylim)
+        # epoch 时间
+        start = self.my_fantastic_logging.get('epoch_start_timestamps', [])
+        end = self.my_fantastic_logging.get('epoch_end_timestamps', [])
+        if len(start) > 0 and len(end) > 0:
+            max_len_t = min(len(start), len(end), epoch + 1)
+            x_t = list(range(max_len_t))
+            epoch_times = [e - s for e, s in zip(end[:max_len_t], start[:max_len_t])]
+            ax.plot(x_t, epoch_times, color='b', ls='-', label="epoch duration", linewidth=4)
+            ylim = [0, ax.get_ylim()[1]]
+            ax.set(ylim=ylim)
         ax.set_xlabel("epoch")
         ax.set_ylabel("time [s]")
-        
-        # Plot Learning Rate
-        ax2.plot(x_values, self.my_fantastic_logging['lrs'][:epoch + 1], color='r', ls='-', label="learning rate", linewidth=4)
+
+        # 学习率
+        x_lr, y_lr = get_xy('lrs')
+        if x_lr is not None:
+            ax2.plot(x_lr, y_lr, color='r', ls='-', label="learning rate", linewidth=4)
         ax2.set_ylabel("learning rate")
 
-        # Combine legends for the fourth plot
         lines, labels = ax.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax2.legend(lines + lines2, labels + labels2, loc=(0.0, 1.01))
+        if lines or lines2:
+            ax2.legend(lines + lines2, labels + labels2, loc=(0.0, 1.01))
 
-        # --- Save Figure ---
         plt.tight_layout()
         fig.savefig(join(output_folder, "progress.png"))
         plt.close()
+
 
     def get_checkpoint(self):
         return self.my_fantastic_logging
