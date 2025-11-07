@@ -161,7 +161,7 @@ class nnUNetTrainer(object):
         self.current_epoch = 0
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
-        self.task_mode = 'cls_only'
+        self.task_mode = 'both'
         print(f"Task mode set to {self.task_mode}")
         self.cls_patch_size = (96, 160, 224)
 
@@ -774,6 +774,7 @@ class nnUNetTrainer(object):
                 initial_patch_size,                      # 👈 seg 模式用 initial_patch_size
                 self.configuration_manager.patch_size,   # 👈 seg 模式用 config 的 patch_size
                 self.label_manager,
+                task_mode= self.task_mode,
                 oversample_foreground_percent=self.oversample_foreground_percent,
                 sampling_probabilities=None,
                 pad_sides=None,
@@ -785,6 +786,7 @@ class nnUNetTrainer(object):
                 self.configuration_manager.patch_size,
                 self.configuration_manager.patch_size,
                 self.label_manager,
+                task_mode= self.task_mode,
                 oversample_foreground_percent=self.oversample_foreground_percent,
                 sampling_probabilities=None,
                 pad_sides=None,

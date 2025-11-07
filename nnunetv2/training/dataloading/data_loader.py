@@ -23,7 +23,7 @@ class nnUNetDataLoader(DataLoader):
                  patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
                  final_patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
                  label_manager: LabelManager,
-                 task_mode: str,  
+                 task_mode: str,
                  oversample_foreground_percent: float = 0.0,
                  sampling_probabilities: Union[List[int], Tuple[int, ...], np.ndarray] = None,
                  pad_sides: Union[List[int], Tuple[int, ...]] = None,
@@ -38,7 +38,9 @@ class nnUNetDataLoader(DataLoader):
         super().__init__(data, batch_size, 1, None, True,
                          False, True, sampling_probabilities)
 
-        assert task_mode in ('seg_only', 'cls_only'), f"task_mode must be 'seg_only' or 'cls_only', got {task_mode}"
+        # 支持 seg_only / cls_only / both
+        assert task_mode in ('seg_only', 'cls_only', 'both'), \
+            f"task_mode must be 'seg_only', 'cls_only' or 'both', got {task_mode}"
         self.task_mode = task_mode
 
         # 2D → 3D 伪 3D 处理
@@ -55,14 +57,12 @@ class nnUNetDataLoader(DataLoader):
         self.oversample_foreground_percent = oversample_foreground_percent
         self.final_patch_size = final_patch_size
         self.patch_size = np.array(patch_size).astype(int)
-        cls_patch_size = np.array([96, 160, 224], dtype=int)
-        # cls 模式下使用单独的 patch size
+
+        # 仅在 cls_only 模式下使用单独的 cls_patch_size
         if self.task_mode == 'cls_only':
+            # 如果没传，就用你硬编码的 ROI 尺寸
             if cls_patch_size is None:
-                raise ValueError(
-                    "task_mode='cls_only' 时必须显式传入 cls_patch_size=(D, H, W)，"
-                    "你可以用前面的统计脚本拿到最大 ROI 尺寸后在这里硬编码。"
-                )
+                cls_patch_size = (96, 160, 224)
             cls_patch_size = np.array(cls_patch_size).astype(int)
             if self.patch_size_was_2d:
                 cls_patch_size = np.concatenate([[1], cls_patch_size])
@@ -70,7 +70,7 @@ class nnUNetDataLoader(DataLoader):
         else:
             self.cls_patch_size = None
 
-        # need_to_pad 还是照原来的算（主要 seg 用）
+        # need_to_pad 还是照原来的算（主要 seg/both 用）
         self.need_to_pad = (self.patch_size - np.array(final_patch_size)).astype(int)
         if pad_sides is not None:
             if self.patch_size_was_2d:
@@ -87,7 +87,7 @@ class nnUNetDataLoader(DataLoader):
             else self._probabilistic_oversampling
         self.transforms = transforms
 
-        # 最后再算 data_shape / seg_shape（cls 用 cls_patch_size）
+        # 最后再算 data_shape / seg_shape（cls_only 用 cls_patch_size）
         self.data_shape, self.seg_shape = self.determine_shapes(label_manager)
 
     def _oversample_last_XX_percent(self, sample_idx: int) -> bool:
@@ -101,6 +101,7 @@ class nnUNetDataLoader(DataLoader):
         data, seg, seg_prev, properties = self._data.load_case(self._data.identifiers[0])
         num_color_channels = data.shape[0]
 
+        # cls_only 用 cls_patch_size，其它模式用 self.patch_size
         if self.task_mode == 'cls_only' and self.cls_patch_size is not None:
             patch = self.cls_patch_size
         else:
@@ -116,7 +117,7 @@ class nnUNetDataLoader(DataLoader):
     def get_bbox(self, data_shape: np.ndarray, force_fg: bool, class_locations: Union[dict, None],
                  overwrite_class: Union[int, Tuple[int, ...]] = None, verbose: bool = False):
         """
-        只给 seg 模式用的随机 bbox（原版 nnUNet 逻辑）
+        只给 seg_only / both 模式用的随机 bbox（原版 nnUNet 逻辑）
         """
         need_to_pad = self.need_to_pad.copy()
         dim = len(data_shape)
@@ -142,7 +143,8 @@ class nnUNetDataLoader(DataLoader):
                     assert overwrite_class in class_locations.keys(), 'desired class ("overwrite_class") does not ' \
                                                                       'have class_locations (missing key)'
                 eligible_classes_or_regions = [i for i in class_locations.keys() if len(class_locations[i]) > 0]
-                tmp = [i == self.annotated_classes_key if isinstance(i, tuple) else False for i in eligible_classes_or_regions]
+                tmp = [i == self.annotated_classes_key if isinstance(i, tuple) else False
+                       for i in eligible_classes_or_regions]
                 if any(tmp):
                     if len(eligible_classes_or_regions) > 1:
                         eligible_classes_or_regions.pop(np.where(tmp)[0][0])
@@ -171,7 +173,7 @@ class nnUNetDataLoader(DataLoader):
         selected_keys = self.get_indices()
 
         # =========================
-        # CLS 模式：固定 cls_patch_size，中心对齐 + pad，不随机 crop
+        # CLS_ONLY 模式：固定 cls_patch_size，中心对齐 + pad，不随机 crop
         # =========================
         if self.task_mode == 'cls_only':
             data_all = np.zeros(self.data_shape, dtype=np.float32)
@@ -189,11 +191,10 @@ class nnUNetDataLoader(DataLoader):
                     )
 
                 data, seg, seg_prev, properties = self._data.load_case(i)
-                img_shape = np.array(data.shape[1:])           # (D,H,W)
-                patch = self.cls_patch_size                    # (pD,pH,pW)
+                img_shape = np.array(data.shape[1:])      # (D,H,W)
+                patch = self.cls_patch_size               # (pD,pH,pW)
 
-
-                # 中心对齐的 bbox（可能会越界 → crop_and_pad_nd 自动 pad）
+                # 中心对齐的 bbox（可能越界 → crop_and_pad_nd 自动 pad）
                 bbox_lbs = []
                 bbox_ubs = []
                 for d in range(len(img_shape)):
@@ -228,23 +229,24 @@ class nnUNetDataLoader(DataLoader):
             return {
                 'data': data_all,              # [B, C, *cls_patch_size]
                 'class_label': class_labels_all,
-                'target': [],
+                'target': [],                  # cls_only 不用 seg
                 'keys': selected_keys
             }
 
         # =========================
-        # SEG 模式：原始 nnUNet + 你的 class_label
+        # SEG_ONLY / BOTH 模式：原始 nnUNet + 你的 class_label
         # =========================
         data_all = np.zeros(self.data_shape, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
         class_labels_all = np.zeros(self.batch_size, dtype=np.int64)
 
         for j, i in enumerate(selected_keys):
+            # 解析分类标签 quiz_LABEL_xxx
             try:
                 class_label = int(i.split('_')[1])
                 class_labels_all[j] = class_label
             except (IndexError, ValueError):
-                class_labels_all[j] = -1
+                class_labels_all[j] = -1   # 出错就标 -1（最好数据里保证格式正确）
 
             force_fg = self.get_do_oversample(j)
             data, seg, seg_prev, properties = self._data.load_case(i)
@@ -302,20 +304,40 @@ if __name__ == '__main__':
     pm = PlansManager(join(folder, os.pardir, 'nnUNetResEncUNetMPlans.json'))
     lm = pm.get_label_manager(load_json(join(folder, os.pardir, 'dataset.json')))
 
-    # 假设你通过上面的统计拿到 max_shape = [96, 160, 224]
     cls_patch_size = (96, 160, 224)
-    # p90: [ 78 146 214]
-    # seg dataloader 测试
-    dl_seg = nnUNetDataLoader(ds, 2, (16, 16, 16), (16, 16, 16), lm,
-                              0.33, None, None, task_mode='seg')
-    b_seg = next(dl_seg)
-    print("seg batch keys:", b_seg.keys())
-    print("seg data shape:", b_seg['data'].shape)
 
-    # cls dataloader 测试（用 cls_patch_size）
+    # seg_only dataloader 测试
+    dl_seg = nnUNetDataLoader(ds, 2, (16, 16, 16), (16, 16, 16), lm,
+                              task_mode='seg_only',
+                              oversample_foreground_percent=0.33,
+                              sampling_probabilities=None,
+                              pad_sides=None,
+                              probabilistic_oversampling=False)
+    b_seg = next(dl_seg)
+    print("seg_only batch keys:", b_seg.keys())
+    print("seg_only data shape:", b_seg['data'].shape, "seg shape:", 
+          b_seg['target'].shape if not isinstance(b_seg['target'], list) else len(b_seg['target']))
+
+    # cls_only dataloader 测试
     dl_cls = nnUNetDataLoader(ds, 2, (1, 1, 1), (1, 1, 1), lm,
-                              0.0, None, None, task_mode='cls',
+                              task_mode='cls_only',
+                              oversample_foreground_percent=0.0,
+                              sampling_probabilities=None,
+                              pad_sides=None,
+                              probabilistic_oversampling=False,
                               cls_patch_size=cls_patch_size)
     b_cls = next(dl_cls)
-    print("cls batch keys:", b_cls.keys())
-    print("cls data shape:", b_cls['data'].shape)
+    print("cls_only batch keys:", b_cls.keys())
+    print("cls_only data shape:", b_cls['data'].shape)
+
+    # both 模式测试（和 seg_only 一样的 patch，只是训练里同时用 seg+cls）
+    dl_both = nnUNetDataLoader(ds, 2, (16, 16, 16), (16, 16, 16), lm,
+                               task_mode='both',
+                               oversample_foreground_percent=0.33,
+                               sampling_probabilities=None,
+                               pad_sides=None,
+                               probabilistic_oversampling=False)
+    b_both = next(dl_both)
+    print("both batch keys:", b_both.keys())
+    print("both data shape:", b_both['data'].shape, "seg shape:",
+          b_both['target'].shape if not isinstance(b_both['target'], list) else len(b_both['target']))

@@ -196,26 +196,31 @@ class ResNet_MTL_nnUNet(nn.Module):
             )
 
         # ---------------------------------
-        # 3. Classification 分支 (bottleneck -> adapter -> GAP -> MLP)
+        # 3. Classification 分支
+        #    输入 = bottleneck GAP + decoder 最后一层 GAP + lesion-masked GAP(decoder)
+        #    向量维度 = C_bottleneck + 2 * C_decoder_last
         # ---------------------------------
-        bottleneck_channels = features_per_stage[-1]
-        total_cls_input_dim = sum(features_per_stage)  # 这里我们用 adapter 把 bottleneck -> 1120
-
-        self.cls_adapter = nn.Sequential(
-            StackedConvBlocks(
-                2, conv_op, bottleneck_channels, bottleneck_channels,
-                kernel_sizes[-1], 1, conv_bias, norm_op, norm_op_kwargs,
-                dropout_op, dropout_op_kwargs, nonlin, nonlin_kwargs
-            ),
-            conv_op(bottleneck_channels, total_cls_input_dim, 1, 1, 0, bias=True)
+        self.bottleneck_channels = features_per_stage[-1]
+        self.decoder_last_channels = features_per_stage[0]     # 最高分辨率 decoder 的通道数
+        self.cls_input_dim = (
+            self.bottleneck_channels               # bottleneck 全局池化
+            + self.decoder_last_channels           # decoder 全局池化
+            + self.decoder_last_channels           # decoder lesion-masked 池化
         )
+
+        hidden_dim1 = self.cls_input_dim // 2
+        hidden_dim2 = max(self.cls_input_dim // 4, cls_num_classes * 2)  # 稍微防止太小
 
         self.classification_head = nn.Sequential(
-            nn.Linear(total_cls_input_dim, total_cls_input_dim // 2),
+            nn.Linear(self.cls_input_dim, hidden_dim1),
             nn.ReLU(inplace=True),
-            nn.Dropout(cls_dropout),
-            nn.Linear(total_cls_input_dim // 2, cls_num_classes)
+            nn.Dropout(p=0.2),
+            nn.Linear(hidden_dim1, hidden_dim2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.2),
+            nn.Linear(hidden_dim2, cls_num_classes)
         )
+
 
     # ======== 一些小工具函数 ========
 
@@ -226,6 +231,11 @@ class ResNet_MTL_nnUNet(nn.Module):
 
     # segmentation 分支前向（不关心梯度，在外层控制）
     def _forward_seg_branch(self, bottleneck_features, skips):
+        """
+        返回:
+          seg_output_return: deep supervision 的输出（或单一输出）
+          decoder_last_features: 最高分辨率 decoder block 的特征，用于 cls 头
+        """
         seg_outputs = []
         x_dec = bottleneck_features
         for i in range(len(self.decoder_blocks)):
@@ -236,17 +246,54 @@ class ResNet_MTL_nnUNet(nn.Module):
             seg_outputs.append(self.seg_layers[i](x_dec))
 
         if self.deep_supervision:
-            seg_output_return = seg_outputs[::-1]
+            seg_output_return = seg_outputs[::-1]  # seg_output_return[0] 是最高分辨率
         else:
             seg_output_return = seg_outputs[-1]
-        return seg_output_return
+
+        decoder_last_features = x_dec  # 最高分辨率 decoder 特征
+        return seg_output_return, decoder_last_features
+
 
     # classification 分支前向（输入是某个 feature map）
-    def _forward_cls_branch(self, bottleneck_features):
-        adapted = self.cls_adapter(bottleneck_features)            # [B, 1120, D, H, W]
-        cls_vec = adapted.mean(dim=(2, 3, 4))                      # [B, 1120]
+    def _forward_cls_branch(self,
+                            bottleneck_features: torch.Tensor,
+                            decoder_last_features: torch.Tensor,
+                            seg_output) -> torch.Tensor:
+        """
+        bottleneck_features: [B, Cb, D, H, W]
+        decoder_last_features: [B, Cd, D, H, W]  (最高分辨率 decoder 特征)
+        seg_output: deep supervision 列表或单一 logits，用于构造 lesion mask
+        """
+        # 1) 取最高分辨率 seg logits
+        if isinstance(seg_output, (list, tuple)):
+            seg_logits = seg_output[0]      # deep supervision 时，第一个是最高分辨率
+        else:
+            seg_logits = seg_output         # [B, K, D, H, W]
+
+        # 2) 全局平均池化 bottleneck 和 decoder_last
+        v_enc = bottleneck_features.mean(dim=(2, 3, 4))            # [B, Cb]
+        v_dec_global = decoder_last_features.mean(dim=(2, 3, 4))   # [B, Cd]
+
+        # 3) 用 seg 输出做 lesion soft mask pooling（非 0 类都当作 lesion）
+        probs = torch.softmax(seg_logits, dim=1)                   # [B, K, D, H, W]
+        if probs.shape[1] > 1:
+            lesion_mask = probs[:, 1:, ...].sum(dim=1, keepdim=True)  # [B,1,D,H,W]
+        else:
+            lesion_mask = probs                                     # 退化情况
+
+        lesion_sum = lesion_mask.sum(dim=(2, 3, 4))                # [B, 1]
+        # 避免空 lesion 时除零
+        v_dec_lesion = (decoder_last_features * lesion_mask).sum(dim=(2, 3, 4)) / (
+            lesion_sum + 1e-6
+        )                                                          # [B, Cd]
+
+        # 4) 拼接成 cls 向量: [Cb + Cd + Cd]
+        cls_vec = torch.cat([v_enc, v_dec_global, v_dec_lesion], dim=1)  # [B, cls_input_dim]
+
+        # 5) 3 层线性 + Dropout(0.2)
         out = self.classification_head(cls_vec)                    # [B, cls_num_classes]
         return out
+
 
     # ======== 主 forward，内置模式控制梯度 ========
 
@@ -267,29 +314,43 @@ class ResNet_MTL_nnUNet(nn.Module):
             skips.append(x_enc)
         bottleneck_features = skips[-1]
 
-        # 2. Segmentation 路径
+                # 2. Segmentation 路径
         if mode == 'cls_only':
             # 只训分类：seg 路径不参与梯度
             with torch.no_grad():
-                seg_output = self._forward_seg_branch(bottleneck_features, skips)
+                seg_output, decoder_last_features = self._forward_seg_branch(bottleneck_features, skips)
         else:
             # both / seg_only：seg 正常产生梯度
-            seg_output = self._forward_seg_branch(bottleneck_features, skips)
+            seg_output, decoder_last_features = self._forward_seg_branch(bottleneck_features, skips)
 
         # 3. Classification 路径
         if mode == 'seg_only':
             # 只训 seg：cls 分支只做前向，无梯度
             with torch.no_grad():
-                cls_output = self._forward_cls_branch(bottleneck_features)
+                cls_output = self._forward_cls_branch(
+                    bottleneck_features,
+                    decoder_last_features,
+                    seg_output
+                )
         elif mode == 'cls_only':
-            # 只训 cls：不让梯度回到 encoder（detach），只更新 cls_adapter + classification_head
+            # 只训 cls：不让梯度回到 encoder/decoder，只更新分类头
             bottleneck_detached = bottleneck_features.detach()
-            cls_output = self._forward_cls_branch(bottleneck_detached)
+            decoder_last_detached = decoder_last_features.detach()
+            cls_output = self._forward_cls_branch(
+                bottleneck_detached,
+                decoder_last_detached,
+                seg_output      # seg_output 本身已经 no_grad
+            )
         else:
-            # both：seg + cls 都回传到 encoder
-            cls_output = self._forward_cls_branch(bottleneck_features)
+            # both：seg + cls 都回传到 encoder/decoder
+            cls_output = self._forward_cls_branch(
+                bottleneck_features,
+                decoder_last_features,
+                seg_output
+            )
 
         return seg_output, cls_output
+
 
 
 # ---------------------------------------------------------------------
