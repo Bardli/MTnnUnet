@@ -157,14 +157,14 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250 
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 200
+        self.num_epochs = 1000
         self.current_epoch = 0
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
         self.task_mode = 'both'
         print(f"Task mode set to {self.task_mode}")
         self.cls_patch_size = (96, 160, 224)
-
+        self.cls_num_classes = 3  # number of lesion subtypes
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
         # labels can either be a list of int (regular training) or a list of tuples of int (region-based training)
@@ -396,6 +396,113 @@ class nnUNetTrainer(object):
 
         return net
 
+    def _compute_voxel_cls_loss(self, logits: torch.Tensor, target_cls_map: torch.Tensor) -> torch.Tensor:
+        """
+        logits:
+            - 新设计: [B, C, D, H, W]，C = cls_num_classes (3)
+        target_cls_map:
+            - 新设计: [B, 1, D, H, W] 或 [B, D, H, W]
+              约定: 0 = 背景(胰腺+其他), 1..C = lesion subtype 0/1/2
+            - 兼容旧版: [B]，case-level label (0/1/2)，会 fallback 到全局 pooling 做 CE
+
+        训练逻辑（新设计）:
+            只在 target_cls_map > 0 的 voxel 上做 CE，
+            并且把标签减 1，使得 subtype 0/1/2 对应 0/1/2。
+        """
+
+        # ---------------------------
+        # 兼容旧版: target 还是 [B] 的情况
+        # ---------------------------
+        if target_cls_map.ndim == 1:
+            # logits 可能是 [B, C, D, H, W]，我们做一个全局平均得到 [B, C]
+            if logits.ndim == 5:
+                logits_global = logits.mean(dim=(2, 3, 4))  # [B, C]
+            elif logits.ndim == 2:
+                logits_global = logits
+            else:
+                raise RuntimeError(f"Unexpected logits shape {logits.shape} for old-style class targets [B].")
+
+            return self.cls_loss(logits_global, target_cls_map.long())
+
+        # ---------------------------
+        # 新设计: voxel-wise subtype map
+        # ---------------------------
+        if logits.ndim != 5:
+            raise RuntimeError(f"Expected cls logits [B, C, D, H, W], got {logits.shape}")
+
+        # target [B, 1, D, H, W] -> [B, D, H, W]
+        if target_cls_map.ndim == 5 and target_cls_map.shape[1] == 1:
+            target_map = target_cls_map[:, 0]
+        elif target_cls_map.ndim == 4:
+            target_map = target_cls_map
+        else:
+            raise RuntimeError(f"Unexpected target_cls_map shape {target_cls_map.shape}")
+
+        B, C, D, H, W = logits.shape
+
+        # 展平成 [N_voxel, C] / [N_voxel]
+        logits_flat = logits.permute(0, 2, 3, 4, 1).reshape(-1, C)  # [N, C]
+        targets_flat = target_map.reshape(-1).long()                # [N]
+
+        # 只在 lesion voxel 上训练: target > 0
+        lesion_mask = targets_flat > 0
+        if not lesion_mask.any():
+            # 这个 batch 没有任何 lesion voxel，返回 0 loss（不影响梯度）
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        logits_valid = logits_flat[lesion_mask]        # [M, C]
+        # 1..C  ->  0..C-1
+        targets_valid = targets_flat[lesion_mask] - 1  # [M]
+
+        return self.cls_loss(logits_valid, targets_valid)
+
+
+    def _voxel_level_to_case_label(self, output_cls: torch.Tensor, target_cls_map: torch.Tensor):
+        """
+        根据体素级 subtype map，按 voxel count 决策 case-level label（pred & gt 都这么算）
+
+        output_cls: [B, C_cls, D, H, W] (logits)
+        target_cls_map: [B, D, H, W] 或 [B,1,D,H,W]，lesion 体素 0..C_cls-1，背景/胰腺 -1
+        返回：
+            case_pred_labels: List[int], len = 有效病例数
+            case_true_labels: List[int], len 同上
+        """
+        if target_cls_map is None:
+            return [], []
+
+        if target_cls_map.ndim == 5:
+            target_cls_map = target_cls_map[:, 0]
+
+        # voxel-level 预测
+        pred_voxel = output_cls.argmax(1)  # [B, D,H,W]
+
+        B = pred_voxel.shape[0]
+        num_cls = self.network.cls_num_classes if hasattr(self.network, 'cls_num_classes') else int(output_cls.shape[1])
+
+        case_pred_labels = []
+        case_true_labels = []
+
+        for b in range(B):
+            gt_map_b = target_cls_map[b]          # [D,H,W]
+            valid_mask_b = gt_map_b >= 0          # lesion 区域
+
+            if not valid_mask_b.any():
+                continue  # 这个 case 没有 lesion，直接跳过（不计入分类指标）
+
+            gt_vals = gt_map_b[valid_mask_b].view(-1).long()          # [N]
+            pred_vals = pred_voxel[b][valid_mask_b].view(-1).long()   # [N]
+
+            # gt & pred 分别按 voxel count 投票
+            gt_counts = torch.bincount(gt_vals, minlength=num_cls)
+            pred_counts = torch.bincount(pred_vals, minlength=num_cls)
+
+            gt_label = int(gt_counts.argmax().item())
+            pred_label = int(pred_counts.argmax().item())
+
+            case_true_labels.append(gt_label)
+            case_pred_labels.append(pred_label)
+
+        return case_pred_labels, case_true_labels
 
     def _get_deep_supervision_scales(self):
         if self.enable_deep_supervision:
@@ -1157,17 +1264,15 @@ class nnUNetTrainer(object):
         if not self.was_initialized:
             self.initialize()
 
-        # dataloaders must be instantiated here (instead of __init__) because they need access to the training data
-        # which may not be present  when doing inference
         self.dataloader_train, self.dataloader_val = self.get_dataloaders()
 
         self.print_to_log_file("Calculating class weights for imbalanced classification task...")
-        
+
         if self.tr_keys is None:
             raise RuntimeError("self.tr_keys was not set in get_tr_and_val_datasets. This should not happen.")
         tr_keys = self.tr_keys
 
-        # 2. 解析 subtype 标签: 假设 identifier 形如 'quiz_0_041' → subtype = 0/1/2
+        # 1. 从文件名解析全局 subtype（例如 quiz_0_041 → 0）
         try:
             tr_labels = [int(k.split('_')[1]) for k in tr_keys]
         except Exception as e:
@@ -1176,16 +1281,16 @@ class nnUNetTrainer(object):
             tr_labels = None
 
         if tr_labels is not None:
-            # 3. 从网络拿到分类头输出类别数
+            # 2. 从网络拿到分类头类别数（现在是 voxel-level conv head）
             if self.is_ddp:
                 net = self.network.module
             else:
                 net = self.network
 
             try:
-                num_classes = net.classification_head[-1].out_features
+                num_classes = net.cls_num_classes
             except Exception as e:
-                self.print_to_log_file(f"!!! WARNING: Could not determine num_classes from classification_head: {e}")
+                self.print_to_log_file(f"!!! WARNING: Could not determine num_classes from net.cls_num_classes: {e}")
                 self.print_to_log_file("!!! Using UNWEIGHTED cls loss.")
                 num_classes = None
 
@@ -1196,29 +1301,24 @@ class nnUNetTrainer(object):
                     self.print_to_log_file(f"!!! WARNING: Classes {np.where(counts==0)[0]} have 0 samples in this fold.")
                     self.print_to_log_file("!!! Using UNWEIGHTED cls loss to avoid division by zero.")
                 else:
-                    # 4. 经典 class-balanced weight：n / (K * n_c)
+                    # class-balanced weight：n / (K * n_c)
                     n_samples = len(tr_labels)
                     weights = n_samples / (num_classes * counts)
 
                     class_weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
 
-                    # 5. ★ 覆盖原有的 cls_loss，之后 train_step 统一用这个 ★
                     self.cls_loss = torch.nn.CrossEntropyLoss(weight=class_weights)
-
                     self.print_to_log_file(f"Successfully applied weighted CrossEntropyLoss.")
                     self.print_to_log_file(f"Class counts (this fold): {counts}")
                     self.print_to_log_file(f"Class weights (this fold): {weights}")
 
-
         maybe_mkdir_p(self.output_folder)
 
-        # make sure deep supervision is on in the network
         self.set_deep_supervision_enabled(self.enable_deep_supervision)
 
         self.print_plans()
         empty_cache(self.device)
 
-        # maybe unpack
         if self.local_rank == 0:
             self.dataset_class.unpack_dataset(
                 self.preprocessed_dataset_folder,
@@ -1229,21 +1329,14 @@ class nnUNetTrainer(object):
         if self.is_ddp:
             dist.barrier()
 
-        # copy plans and dataset.json so that they can be used for restoring everything we need for inference
         save_json(self.plans_manager.plans, join(self.output_folder_base, 'plans.json'), sort_keys=False)
         save_json(self.dataset_json, join(self.output_folder_base, 'dataset.json'), sort_keys=False)
-
-        # we don't really need the fingerprint but its still handy to have it with the others
         shutil.copy(join(self.preprocessed_dataset_folder_base, 'dataset_fingerprint.json'),
                     join(self.output_folder_base, 'dataset_fingerprint.json'))
 
-        # produces a pdf in output folder
         self.plot_network_architecture()
-
         self._save_debug_information()
 
-        # print(f"batch size: {self.batch_size}")
-        # print(f"oversample: {self.oversample_foreground_percent}")
 
     def on_train_end(self):
         # dirty hack because on_epoch_end increments the epoch counter and this is executed afterwards.
@@ -1289,74 +1382,43 @@ class nnUNetTrainer(object):
 
 
     def train_step(self, batch: dict) -> dict:
-        """
-        多任务单步训练：
-        - task_mode = 'seg_only' : 只训练 segmentation，cls 头前向但不产生梯度（在模型里控制）
-        - task_mode = 'cls_only' : 只训练 classification，encoder+decoder 不反传梯度（在模型里控制）
-        - task_mode = 'both'     : seg + cls 一起训（共享 encoder，按 lambda_seg / lambda_cls 加权）
-        """
         data = batch['data']
-        target_seg = batch['target']       # deep supervision 时为 list
-        target_cls = batch['class_label']  # (B,)
+        target_seg = batch['target']        # seg label (原逻辑不变)
+        target_cls_map = batch['class_label']  # 现在可以是 [B] 或 [B,1,D,H,W]
 
         data = data.to(self.device, non_blocking=True)
-        target_cls = target_cls.to(self.device, non_blocking=True)
 
         if isinstance(target_seg, list):
             target_seg = [i.to(self.device, non_blocking=True) for i in target_seg]
         else:
             target_seg = target_seg.to(self.device, non_blocking=True)
 
+        target_cls_map = torch.as_tensor(target_cls_map, device=self.device)
+
         self.optimizer.zero_grad(set_to_none=True)
+        mode = self.task_mode
 
-        mode = self.task_mode  # 当前训练模式：'seg_only' / 'cls_only' / 'both'
-
-        # Mixed precision on CUDA
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            # 网络返回 (seg_output, cls_output)
-            # task_mode 的具体梯度逻辑在模型内部处理
             output_seg, output_cls = self.network(data)
 
             if mode == 'seg_only':
-                # 只训 seg：cls 分支在模型里已经 no_grad，这里 loss 置 0 就好
                 self.lambda_seg, self.lambda_cls = 1.0, 0.0
                 l_seg = self.seg_loss(output_seg, target_seg)
                 l_cls = torch.zeros(1, device=self.device, dtype=l_seg.dtype)
                 l = l_seg
 
             elif mode == 'cls_only':
-                # 只训 cls：模型里已经保证 encoder/decoder 不反传梯度
                 self.lambda_seg, self.lambda_cls = 0.0, 1.0
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
-                l_cls = self.cls_loss(output_cls, target_cls)
+                l_cls = self._compute_voxel_cls_loss(output_cls, target_cls_map)
                 l = l_cls
 
-            else:  # mode == 'both'
-                # seg + cls 一起训，保持你之前的实现（早期多给一点 cls）
-
-                self.lambda_seg = 1
-                self.lambda_cls = 0.5
-
-                # seg_loss 内部已经处理 deep supervision（DeepSupervisionWrapper）
+            else:  # both
+                self.lambda_seg, self.lambda_cls = 1.0, 1.0
                 l_seg = self.seg_loss(output_seg, target_seg)
-
-                # 先拿最高分辨率的 target，用于判断是否有肿瘤
-                if isinstance(target_seg, list):
-                    seg_hires = target_seg[0]     # (B, D, H, W)
-                else:
-                    seg_hires = target_seg        # (B, D, H, W)
-
-                # 简单假设：>0 就算 lesion
-                lesion_mask  = (seg_hires > 0)
-                has_lesion = lesion_mask.view(lesion_mask.shape[0], -1).any(dim=1)   # (B,) bool
-
-                if has_lesion.any():
-                    l_cls = self.cls_loss(output_cls[has_lesion], target_cls[has_lesion])
-                else:
-                    # 没有任何 lesion patch，就不给 cls 梯度
-                    l_cls = 0.0 * output_cls.sum()
-
+                l_cls = self._compute_voxel_cls_loss(output_cls, target_cls_map)
                 l = self.lambda_seg * l_seg + self.lambda_cls * l_cls
+
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1370,10 +1432,11 @@ class nnUNetTrainer(object):
             self.optimizer.step()
 
         return {
-            'loss': l.detach().cpu().numpy(),         # 总损失（取决于 task_mode）
-            'loss_seg': l_seg.detach().cpu().numpy(), # seg 损失（seg_only/ both 有意义）
-            'loss_cls': l_cls.detach().cpu().numpy()  # cls 损失（cls_only/ both 有意义）
+            'loss': l.detach().cpu().numpy(),
+            'loss_seg': l_seg.detach().cpu().numpy(),
+            'loss_cls': l_cls.detach().cpu().numpy()
         }
+
 
 
     
@@ -1412,45 +1475,39 @@ class nnUNetTrainer(object):
 
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
-        target_seg = batch.get('target', None)      # cls_only 里可能是 dummy
-        target_cls = batch['class_label']
+        target_seg = batch.get('target', None)
+        target_cls_map = batch['class_label']  # voxel map 或 [B]
+        keys = batch['keys']                   # ['quiz_0_xxx', 'quiz_1_xxx', ...]
 
         data = data.to(self.device, non_blocking=True)
-        target_cls = target_cls.to(self.device, non_blocking=True)
+        target_cls_map = torch.as_tensor(target_cls_map, device=self.device)
 
-        mode = self.task_mode  # 当前模式
+        mode = self.task_mode
 
-        if mode != 'cls_only':
-            # 只有 seg/both 模式才需要把 seg 搬到 device
+        if mode != 'cls_only' and target_seg is not None:
             if isinstance(target_seg, list):
                 target_seg = [i.to(self.device, non_blocking=True) for i in target_seg]
             else:
                 target_seg = target_seg.to(self.device, non_blocking=True)
 
-        # ---- forward ----
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output_seg, output_cls = self.network(data)
             del data
 
+            # ---- loss 计算 ----
             if mode == 'cls_only':
-                # 只关心分类
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
-                l_cls = self.cls_loss(output_cls, target_cls)
+                l_cls = self._compute_voxel_cls_loss(output_cls, target_cls_map)
                 l = l_cls
             else:
-                # seg_only 或 both
                 l_seg = self.seg_loss(output_seg, target_seg)
-                l_cls = self.cls_loss(output_cls, target_cls)
-                if mode == 'seg_only':
-                    l = l_seg
-                else:  # both
-                    l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
+                l_cls = self._compute_voxel_cls_loss(output_cls, target_cls_map)
+                l = l_seg if mode == 'seg_only' else (self.lambda_seg * l_seg + self.lambda_cls * l_cls)
 
         # =========================
-        # 分割指标：cls_only 直接跳过
+        # 分割指标（原逻辑保持不变）
         # =========================
         if mode == 'cls_only':
-            # 构造 0 占位，长度和前景类数一致
             if self.label_manager.has_regions:
                 n_fg = len(self.label_manager.foreground_regions)
             else:
@@ -1459,13 +1516,11 @@ class nnUNetTrainer(object):
             fp_hard = np.zeros(n_fg, dtype=np.float64)
             fn_hard = np.zeros(n_fg, dtype=np.float64)
         else:
-            # 原来的 seg 评估逻辑
+            # ... 这里保持你原来的 tp/fp/fn 计算逻辑，不改 ...
             if self.enable_deep_supervision:
                 output_seg = output_seg[0]
                 target_seg = target_seg[0]
-
             axes = [0] + list(range(2, output_seg.ndim))
-
             if self.label_manager.has_regions:
                 predicted_segmentation_onehot = (torch.sigmoid(output_seg) > 0.5).long()
             else:
@@ -1501,6 +1556,56 @@ class nnUNetTrainer(object):
                 fp_hard = fp_hard[1:]
                 fn_hard = fn_hard[1:]
 
+        # =========================
+        # 分类 metrics：按 voxel count 决定 case-level 预测
+        # =========================
+        # 1) 解析 GT case label: 从 key 里解析 subtype0/1/2
+        #    假设 identifier: 'quiz_0_041' -> subtype = 0
+        gt_case_labels = []
+        for k in keys:
+            try:
+                gt_case_labels.append(int(k.split('_')[1]))
+            except Exception:
+                gt_case_labels.append(0)  # fallback，至少不崩
+
+        gt_case_labels = torch.as_tensor(gt_case_labels, device=output_cls.device, dtype=torch.long)
+
+        # 2) 预测 case label: voxel-level argmax + voxel count 最大的类
+        if output_cls.ndim == 5:
+            # [B, C, D, H, W]
+            with torch.no_grad():
+                cls_voxel = output_cls.argmax(1)  # [B, D, H, W], 0..C-1
+
+                case_pred = []
+                B = cls_voxel.shape[0]
+
+                # 尝试用 target_cls_map 里 >0 的位置当 lesion mask，只统计 lesion voxel
+                if target_cls_map.ndim == 5 and target_cls_map.shape[1] == 1:
+                    tgt_map = target_cls_map[:, 0]
+                elif target_cls_map.ndim == 4:
+                    tgt_map = target_cls_map
+                else:
+                    tgt_map = None
+
+                for b in range(B):
+                    if tgt_map is not None:
+                        lesion_mask = tgt_map[b] > 0
+                        if lesion_mask.any():
+                            vox = cls_voxel[b][lesion_mask]
+                        else:
+                            vox = cls_voxel[b].reshape(-1)
+                    else:
+                        vox = cls_voxel[b].reshape(-1)
+
+                    # 统计每个 subtype 的 voxel 数
+                    hist = torch.bincount(vox, minlength=self.cls_num_classes)
+                    # argmax -> case-level 预测（0/1/2）
+                    case_pred.append(int(torch.argmax(hist).item()))
+                case_pred = torch.as_tensor(case_pred, device=output_cls.device, dtype=torch.long)
+        else:
+            # 退化：如果 output_cls 已经是 [B, C]
+            case_pred = output_cls.argmax(1)
+
         return {
             'loss': l.detach().cpu().numpy(),
             'loss_seg': l_seg.detach().cpu().numpy(),
@@ -1508,15 +1613,17 @@ class nnUNetTrainer(object):
             'tp_hard': tp_hard,
             'fp_hard': fp_hard,
             'fn_hard': fn_hard,
-            'cls_pred': output_cls.detach().cpu().numpy(),
-            'cls_target': target_cls.detach().cpu().numpy()
+            'cls_pred': case_pred.detach().cpu().numpy(),         # [B] (0/1/2)
+            'cls_target': gt_case_labels.detach().cpu().numpy(),  # [B] (0/1/2)
         }
+
+
 
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
-        
-        # --- 1. 收集分割指标 (TP, FP, FN) ---
+
+        # --- 分割指标 ---
         tp = np.sum(outputs_collated['tp_hard'], 0)
         fp = np.sum(outputs_collated['fp_hard'], 0)
         fn = np.sum(outputs_collated['fn_hard'], 0)
@@ -1524,22 +1631,19 @@ class nnUNetTrainer(object):
         if self.is_ddp:
             world_size = dist.get_world_size()
 
-            # 收集 TPs
             tps = [None for _ in range(world_size)]
             dist.all_gather_object(tps, tp)
             tp = np.vstack([i[None] for i in tps]).sum(0)
 
-            # 收集 FPs
             fps = [None for _ in range(world_size)]
             dist.all_gather_object(fps, fp)
             fp = np.vstack([i[None] for i in fps]).sum(0)
 
-            # 收集 FNs
             fns = [None for _ in range(world_size)]
             dist.all_gather_object(fns, fn)
             fn = np.vstack([i[None] for i in fns]).sum(0)
 
-            # --- 2. GAI: 收集所有损失 ---
+            # 损失
             losses_val = [None for _ in range(world_size)]
             dist.all_gather_object(losses_val, outputs_collated['loss'])
             loss_here = np.vstack(losses_val).mean()
@@ -1552,51 +1656,47 @@ class nnUNetTrainer(object):
             dist.all_gather_object(losses_cls_val, outputs_collated['loss_cls'])
             loss_cls_here = np.vstack(losses_cls_val).mean()
 
-            # --- 3. GAI: 收集分类结果 ---
+            # 分类 case-level 预测 & GT（都是 1D int）
             cls_preds_all = [None for _ in range(world_size)]
             dist.all_gather_object(cls_preds_all, outputs_collated['cls_pred'])
-            # 预测值 (logits 或 probs)
-            cls_preds = np.concatenate([item for sublist in cls_preds_all for item in sublist])
-
             cls_targets_all = [None for _ in range(world_size)]
             dist.all_gather_object(cls_targets_all, outputs_collated['cls_target'])
-            # 真实标签 (整数)
-            cls_targets = np.concatenate([item for sublist in cls_targets_all for item in sublist])
+
+            cls_preds = np.concatenate(cls_preds_all) if len(cls_preds_all) > 0 else np.array([], dtype=np.int64)
+            cls_targets = np.concatenate(cls_targets_all) if len(cls_targets_all) > 0 else np.array([], dtype=np.int64)
 
         else:
-            # --- 2. GAI: 收集所有损失 (non-DDP) ---
             loss_here = np.mean(outputs_collated['loss'])
             loss_seg_here = np.mean(outputs_collated['loss_seg'])
             loss_cls_here = np.mean(outputs_collated['loss_cls'])
 
-            # --- 3. GAI: 收集分类结果 (non-DDP) ---
-            cls_preds = np.concatenate(outputs_collated['cls_pred'])
-            cls_targets = np.concatenate(outputs_collated['cls_target'])
+            cls_preds = np.concatenate(outputs_collated['cls_pred']) if len(outputs_collated['cls_pred']) > 0 else np.array([], dtype=np.int64)
+            cls_targets = np.concatenate(outputs_collated['cls_target']) if len(outputs_collated['cls_target']) > 0 else np.array([], dtype=np.int64)
 
-        # --- 4. GAI: 计算分割指标 ---
-        # 防止除以零
-        global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) if (2 * i + j + k) > 0 else 0 for i, j, k in zip(tp, fp, fn)]]
+        # Dice
+        global_dc_per_class = [
+            (2 * i / (2 * i + j + k) if (2 * i + j + k) > 0 else 0)
+            for i, j, k in zip(tp, fp, fn)
+        ]
         mean_fg_dice = np.nanmean(global_dc_per_class)
-        
-        # --- 5. GAI: 计算分类指标 ---
-        # 假设 cls_preds 是 logits/probs，我们需要 argmax 来获取预测类别
-        cls_preds_int = np.argmax(cls_preds, axis=1)
-        
-        # 计算 Macro F1-Score
-        macro_f1 = f1_score(cls_targets, cls_preds_int, average='macro', zero_division=0)
-        # 计算 Accuracy
-        accuracy = accuracy_score(cls_targets, cls_preds_int)
 
-        # --- 6. GAI: 记录所有指标 ---
+        # 分类指标（case-level, 已经是 int，不需要 argmax）
+        if cls_targets.size > 0:
+            macro_f1 = f1_score(cls_targets, cls_preds, average='macro', zero_division=0)
+            accuracy = accuracy_score(cls_targets, cls_preds)
+        else:
+            macro_f1 = 0.0
+            accuracy = 0.0
+
+        # logging
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
         self.logger.log('val_loss_seg', loss_seg_here, self.current_epoch)
         self.logger.log('val_loss_cls', loss_cls_here, self.current_epoch)
-        # self.logger.log('val_classification_targets', cls_targets.tolist(),  self.current_epoch)
-        # self.logger.log('val_classification_predictions', cls_preds.tolist(),  self.current_epoch)
         self.logger.log('val_macro_f1', macro_f1, self.current_epoch)
         self.logger.log('val_accuracy', accuracy, self.current_epoch)
+
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
@@ -1609,7 +1709,7 @@ class nnUNetTrainer(object):
         self.debug_check_param("decoder_blocks.0")        # 最靠近输出的 decoder block
 
         # 看分类头
-        self.debug_check_param("classification_head.0")
+        self.debug_check_param("cls_head")
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
         # --- GAI: 打印所有训练和验证损失 ---
