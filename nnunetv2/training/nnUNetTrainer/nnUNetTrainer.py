@@ -1138,10 +1138,6 @@ class nnUNetTrainer(object):
         return ComposeTransforms(transforms)
 
     def set_deep_supervision_enabled(self, enabled: bool):
-        """
-        This function is specific for the default architecture in nnU-Net. If you change the architecture, there are
-        chances you need to change this as well!
-        """
         if self.is_ddp:
             mod = self.network.module
         else:
@@ -1149,7 +1145,13 @@ class nnUNetTrainer(object):
         if isinstance(mod, OptimizedModule):
             mod = mod._orig_mod
 
+        # 1) 自己加的标志，留着也没问题
         mod.deep_supervision = enabled
+
+        # 2) 真正控制输出的是 decoder 的 deep_supervision
+        if hasattr(mod, 'decoder'):
+            mod.decoder.deep_supervision = enabled
+
 
     def on_train_start(self):
         if not self.was_initialized:

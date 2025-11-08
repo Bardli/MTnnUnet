@@ -596,46 +596,78 @@ class nnUNetPredictor(object):
     #         prediction /= (len(axes_combinations) + 1)
     #     return prediction
     @torch.inference_mode()
-    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]: # GAI: 返回元组
+    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        适配多任务网络:
+        - self.network(x) 返回 (seg, cls)
+        - seg 可能是 Tensor 或 list[Tensor] (deep supervision)
+        这里统一转成: seg_logits: Tensor, cls_logits: Tensor
+        """
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
-        
-        # --- GAI (修改点 1) ---
-        # 我们的模型返回 (seg, cls)。
-        network_output_seg, network_output_cls = self.network(x)
-        
-        # 初始化累加器
-        prediction_seg = network_output_seg
-        prediction_cls = network_output_cls # 形状 [1, Num_Classes]
+
+        # ---------- 第一次正向 ----------
+        out = self.network(x)
+
+        # 兼容: 可能是 (seg, cls) 或 只有 seg
+        if isinstance(out, (list, tuple)) and len(out) == 2:
+            seg_out, cls_out = out
+        else:
+            seg_out, cls_out = out, None
+
+        # seg_out 可能是 deep supervision list，取最高分辨率那一张
+        if isinstance(seg_out, (list, tuple)):
+            seg_out = seg_out[0]
+
+        prediction_seg = seg_out
+        prediction_cls = cls_out
         num_predictions = 1
-        # --- GAI 结束 ---
 
+        # ---------- TTA 镜像 ----------
         if mirror_axes is not None:
-            # check for invalid numbers in mirror_axes
-            # x should be 5d for 3d images and 4d for 2d. so the max value of mirror_axes cannot exceed len(x.shape) - 3
+            # x: [B, C, D, H, W]，镜像轴是空间轴，最多到 ndim-3
             assert max(mirror_axes) <= x.ndim - 3, 'mirror_axes does not match the dimension of the input!'
-
+            # nnU-Net 约定 mirror_axes 是不带通道的空间轴，从 0 开始，需要 +2
             mirror_axes = [m + 2 for m in mirror_axes]
             axes_combinations = [
                 c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
             ]
+
             for axes in axes_combinations:
-                # --- GAI (修改点 2) ---
-                # 再次调用网络并获取两个输出
-                mirrored_output_seg, mirrored_output_cls = self.network(torch.flip(x, axes))
-                
-                # 累加 TTA 结果
-                prediction_seg += torch.flip(mirrored_output_seg, axes)
-                prediction_cls += mirrored_output_cls
+                out_m = self.network(torch.flip(x, axes))
+
+                if isinstance(out_m, (list, tuple)) and len(out_m) == 2:
+                    seg_m, cls_m = out_m
+                else:
+                    seg_m, cls_m = out_m, None
+
+                if isinstance(seg_m, (list, tuple)):
+                    seg_m = seg_m[0]
+
+                # 先网络 -> 再 flip 回来
+                seg_m = torch.flip(seg_m, axes)
+                prediction_seg += seg_m
+
+                if cls_m is not None:
+                    if prediction_cls is None:
+                        prediction_cls = cls_m
+                    else:
+                        prediction_cls += cls_m
+
                 num_predictions += 1
-                # --- GAI 结束 ---
-        
-        # --- GAI (修改点 3) ---
-        # 分别对 seg 和 cls 进行平均
-        prediction_seg /= num_predictions
-        prediction_cls /= num_predictions
-        
-        return prediction_seg, prediction_cls # GAI: 返回两个结果
-        # --- GAI 结束 ---
+
+        # ---------- 平均 ----------
+        prediction_seg = prediction_seg / num_predictions
+        if prediction_cls is not None:
+            prediction_cls = prediction_cls / num_predictions
+        else:
+            # 如果某些模型没 cls 分支，兜底造一个 0 向量，防止后面代码崩
+            b = x.shape[0]
+            num_cls = getattr(self.network, 'cls_num_classes', 1)
+            prediction_cls = torch.zeros(b, num_cls, device=x.device, dtype=prediction_seg.dtype)
+
+        return prediction_seg, prediction_cls
+
+
 
     @torch.inference_mode()
     def _internal_predict_sliding_window_return_logits(self,
