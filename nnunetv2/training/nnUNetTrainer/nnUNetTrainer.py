@@ -161,7 +161,7 @@ class nnUNetTrainer(object):
         self.current_epoch = 0
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
-        self.task_mode = 'both'
+        self.task_mode = 'cls_only'
         print(f"Task mode set to {self.task_mode}")
         self.cls_patch_size = (96, 160, 224)
 
@@ -1183,11 +1183,24 @@ class nnUNetTrainer(object):
                 net = self.network
 
             try:
-                num_classes = net.classification_head[-1].out_features
+                head = getattr(net, 'classification_head', None)
+                if head is not None:
+                    if isinstance(head, nn.Sequential):
+                        last = list(head.children())[-1]
+                    else:
+                        last = head
+                    num_classes = last.out_features
+                elif hasattr(net, 'cls_out'):
+                    num_classes = net.cls_out.out_features
+                elif hasattr(net, 'cls_num_classes'):
+                    num_classes = net.cls_num_classes
+                else:
+                    raise RuntimeError("no head found")
             except Exception as e:
-                self.print_to_log_file(f"!!! WARNING: Could not determine num_classes from classification_head: {e}")
+                self.print_to_log_file(f"!!! WARNING: Could not determine num_classes from model: {e}")
                 self.print_to_log_file("!!! Using UNWEIGHTED cls loss.")
                 num_classes = None
+
 
             if num_classes is not None:
                 counts = np.bincount(tr_labels, minlength=num_classes)
@@ -1602,14 +1615,20 @@ class nnUNetTrainer(object):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
 
     def on_epoch_end(self):
-        # 看 encoder bottleneck
-        self.debug_check_param("conv_encoder_blocks.5")   # 最后一层 encoder
+        # 看 encoder 里有没有在更新（整块 encoder）
+        self.debug_check_param("encoder")
 
-        # 看 decoder 最后一层
-        self.debug_check_param("decoder_blocks.0")        # 最靠近输出的 decoder block
+        # 看 decoder 里有没有在更新
+        self.debug_check_param("decoder")
 
-        # 看分类头
-        self.debug_check_param("classification_head.0")
+        # 看新的分类头：投影层
+        self.debug_check_param("ct_proj")
+
+        # 看 Dual-path Transformer 是否在更新
+        self.debug_check_param("dual_block")
+
+        # 看最终分类输出层
+        self.debug_check_param("cls_out")
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
         # --- GAI: 打印所有训练和验证损失 ---
@@ -1988,9 +2007,9 @@ class nnUNetTrainer(object):
 # Plan
 # nnUNetv2_plan_and_preprocess -d 002 -pl nnUNetPlannerResEncM
 # train
-# nnUNetv2_train 002 3d_fullres 5 -p nnUNetResEncUNetMPlans 
+# nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans 
 # train cls
-# nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans -pretrained_weights F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\bestsig\20251107_best3.pth
+# nnUNetv2_train 002 3d_fullres 5 -p nnUNetResEncUNetMPlans -pretrained_weights F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\bestsig\20251107_best3.pth
 
 # predict
 # nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 5

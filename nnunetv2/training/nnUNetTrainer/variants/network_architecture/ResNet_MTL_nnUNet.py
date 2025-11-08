@@ -8,15 +8,119 @@ from dynamic_network_architectures.building_blocks.residual import BasicBlockD, 
 from dynamic_network_architectures.initialization.weight_init import (
     InitWeights_He, init_last_bn_before_add_to_0
 )
+from torch.amp import autocast as autocast_cuda
+
+
+class DualPathTransformerBlock(nn.Module):
+    """
+    轻量版 Dual-path Transformer：
+      - ct_token <- mem_tokens (cross-attn)
+      - mem_tokens <- ct_token (cross-attn)
+      - 各自 FFN + 残差
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int = 4,
+        ff_mult: int = 2,
+        attn_dropout: float = 0.1,
+        ffn_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.d_model = d_model
+
+        # cross-attn: ct <- mem
+        self.norm_ct1 = nn.LayerNorm(d_model)
+        self.norm_mem1 = nn.LayerNorm(d_model)
+        self.attn_ct_from_mem = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=attn_dropout,
+            batch_first=True,
+        )
+
+        # cross-attn: mem <- ct
+        self.norm_ct2 = nn.LayerNorm(d_model)
+        self.norm_mem2 = nn.LayerNorm(d_model)
+        self.attn_mem_from_ct = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=attn_dropout,
+            batch_first=True,
+        )
+
+        # FFN for ct token
+        self.ff_ct = nn.Sequential(
+            nn.Linear(d_model, d_model * ff_mult),
+            nn.GELU(),
+            nn.Dropout(ffn_dropout),
+            nn.Linear(d_model * ff_mult, d_model),
+        )
+        self.ff_ct_norm = nn.LayerNorm(d_model)
+
+        # FFN for mem tokens
+        self.ff_mem = nn.Sequential(
+            nn.Linear(d_model, d_model * ff_mult),
+            nn.GELU(),
+            nn.Dropout(ffn_dropout),
+            nn.Linear(d_model * ff_mult, d_model),
+        )
+        self.ff_mem_norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        ct_token: torch.Tensor,   # [B, 1, D]
+        mem_tokens: torch.Tensor  # [B, M, D]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # === 强制用 float32，避免 AMP 下 multiheadattention 溢出 ===
+        ct_token = ct_token.float()
+        mem_tokens = mem_tokens.float()
+
+        # ----- 路径1: ct <- mem -----
+        ct_res = ct_token
+        mem_res = mem_tokens
+
+        ct_norm = self.norm_ct1(ct_token)
+        mem_norm = self.norm_mem1(mem_tokens)
+        ct_updated, _ = self.attn_ct_from_mem(
+            query=ct_norm,
+            key=mem_norm,
+            value=mem_norm,
+            need_weights=False,
+        )
+        ct_token = ct_res + ct_updated
+
+        # ----- 路径2: mem <- ct -----
+        ct_norm2 = self.norm_ct2(ct_token)
+        mem_norm2 = self.norm_mem2(mem_tokens)
+        mem_updated, _ = self.attn_mem_from_ct(
+            query=mem_norm2,
+            key=ct_norm2,
+            value=ct_norm2,
+            need_weights=False,
+        )
+        mem_tokens = mem_res + mem_updated
+
+        # ----- FFN + 残差 -----
+        ct_ff = self.ff_ct(ct_token)
+        ct_token = self.ff_ct_norm(ct_token + ct_ff)
+
+        mem_ff = self.ff_mem(mem_tokens)
+        mem_tokens = self.ff_mem_norm(mem_tokens + mem_ff)
+
+        # 这里直接保持 float32 输出就行，外面 cls_out 也是 float32 计算
+        return ct_token, mem_tokens
 
 
 class ResNet_MTL_nnUNet(ResidualEncoderUNet):
     """
     seg 分支：完全使用原版 ResidualEncoderUNet 的 encoder + UNetDecoder
-    cls 分支：PANDA 风格
-        - 直接从 encoder 的多尺度特征 (skips 的各层) 做全局池化
-        - 将各尺度 pooled 向量拼接
-        - 通过两层 MLP 输出分类 logits
+    cls 分支：
+        - encoder 多尺度特征 global max pooling -> concat -> multi_scale_feat
+        - multi_scale_feat -> ct_token (1 token)
+        - 3 个记忆原型 token（每类 1 个）
+        - Dual-path Transformer 交互
+        - ct_token -> Linear 输出 3 类 logits
 
     task_mode:
       - 'seg_only' : 只训 seg（cls 分支 no_grad）
@@ -25,7 +129,7 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
     """
     def __init__(
         self,
-        # --- 这部分必须和 plans 里的 ResidualEncoderUNet 完全对齐 ---
+        # --- 与原版 ResidualEncoderUNet 对齐 ---
         input_channels: int,
         n_stages: int,
         features_per_stage: Union[int, List[int], Tuple[int, ...]],
@@ -87,38 +191,47 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         assert len(feat_list) == n_stages, "features_per_stage 长度必须等于 n_stages"
         self.encoder_feat_channels = feat_list
 
-        # PANDA 多尺度：使用所有 stage 的 encoder 特征做 global pooling
+        # 多尺度 pooled feature 总维度
         self.cls_feat_dim = sum(self.encoder_feat_channels)
 
-        # 两层 MLP 分类头（PANDA 风格）
-        hidden_dim = max(self.cls_feat_dim // 2, cls_num_classes * 2)
-        self.classification_head = nn.Sequential(
-            nn.Linear(self.cls_feat_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=cls_dropout),
-            nn.Linear(hidden_dim, cls_num_classes),
+        # 将多尺度特征投到较小维度 d_model，当成一个 ct token
+        self.d_model = min(256, self.cls_feat_dim)  # 控制容量，避免 240 例过拟合太严重
+        self.ct_proj = nn.Linear(self.cls_feat_dim, self.d_model)
+
+        # 3 个类的记忆原型 token（3 分类）
+        # shape: [num_classes, d_model]
+        self.prototype_memory = nn.Parameter(
+            torch.randn(cls_num_classes, self.d_model) * 0.02
         )
 
-        # 初始化：沿用 nnUNet 风格（相当于对整个网络做 He init）
+        # 单层 Dual-path Transformer block
+        self.dual_block = DualPathTransformerBlock(
+            d_model=self.d_model,
+            num_heads=4,
+            ff_mult=2,
+            attn_dropout=0.1,
+            ffn_dropout=cls_dropout,
+        )
+
+        # 最后的分类头：直接用 ct_token 的表示做线性分类
+        self.cls_out = nn.Linear(self.d_model, cls_num_classes)
+
+        # 初始化（卷积/线性等）
         InitWeights_He(1e-2)(self)
         init_last_bn_before_add_to_0(self)
+        # 原型在上面已经手动 normal 初始化了，不会被 He 覆盖
 
     # ---- 小工具：外部可以随时切模式 ----
     def set_task_mode(self, mode: str):
         assert mode in ('seg_only', 'both', 'cls_only')
         self.task_mode = mode
 
-    # ---- 主 forward：严格保持 seg 路径与原生 ResidualEncoderUNet 一致 ----
+    # ---- 主 forward：seg 路径保持 nnUNet 原样 ----
     def forward(self, x, task_mode: str = None):
-        """
-        seg 分支严格保持：
-            skips = self.encoder(x)
-            seg   = self.decoder(skips)
-        """
         mode = task_mode if task_mode is not None else self.task_mode
         assert mode in ('seg_only', 'both', 'cls_only')
 
-        # ---- encoder + decoder ----
+        # encoder + decoder
         if mode == 'cls_only':
             # 只做分类：encoder/decoder 不要梯度
             with torch.no_grad():
@@ -129,42 +242,50 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
             skips = self.encoder(x)
             seg_output = self.decoder(skips)
 
-        # ---- 分类分支（PANDA 多尺度全局池化） ----
+        # 分类分支
         if mode == 'seg_only':
-            # 只训 seg：分类头 no_grad，完全不更新 cls 参数
             with torch.no_grad():
                 cls_output = self._forward_cls_branch(skips)
         elif mode == 'cls_only':
-            # 只训 cls：encoder/decoder 在上面已经 no_grad，这里可以更新 cls 参数
             cls_output = self._forward_cls_branch(skips)
         else:  # both
             cls_output = self._forward_cls_branch(skips)
 
         return seg_output, cls_output
 
-    # ---- PANDA 风格分类分支：多尺度 encoder 特征 + 全局 max pooling + MLP ----
+    # ---- 分类分支：多尺度 pooling + Dual-path Transformer + 记忆原型 ----
     def _forward_cls_branch(self, skips: List[torch.Tensor]) -> torch.Tensor:
         """
-        skips: encoder 各 stage 输出的特征列表
-            len(skips) = n_stages
-            每个元素形状: [B, C_i, D_i, H_i, W_i]
-
-        做法：
-          1) 对每个 stage 特征做 global max pooling -> [B, C_i]
-          2) 沿通道维拼接 -> [B, sum_i C_i] = [B, cls_feat_dim]
-          3) MLP 分类头 -> [B, cls_num_classes]
+        skips: encoder 各 stage 输出
         """
-        pooled_feats = []
-        for feat in skips:
-            # 自适应全局 max pooling 到 1x1x1
-            # feat: [B, C, D, H, W]
-            pooled = F.adaptive_max_pool3d(feat, output_size=1)  # [B, C, 1, 1, 1]
-            pooled = pooled.view(pooled.size(0), -1)             # [B, C]
-            pooled_feats.append(pooled)
+        # === 整个分类分支强制用 float32，避开 AMP 溢出 ===
+        with autocast_cuda('cuda',enabled=False):
+            pooled_feats = []
+            for feat in skips:
+                # 先转 float32，再做 pooling（有些 encoder 输出可能是 half）
+                feat = feat.float()
+                pooled = F.adaptive_max_pool3d(feat, output_size=1)  # [B, C, 1, 1, 1]
+                pooled = pooled.view(pooled.size(0), -1)             # [B, C]
+                pooled_feats.append(pooled)
 
-        # 多尺度特征拼接
-        multi_scale_feat = torch.cat(pooled_feats, dim=1)        # [B, cls_feat_dim]
+            # 拼接多尺度特征: [B, cls_feat_dim]
+            multi_scale_feat = torch.cat(pooled_feats, dim=1).float()
 
-        # MLP 分类头
-        cls_logits = self.classification_head(multi_scale_feat)  # [B, cls_num_classes]
+            # 投到 d_model 维作为单个 CT token: [B, 1, d_model]
+            ct_token = self.ct_proj(multi_scale_feat)      # [B, d_model], fp32
+            ct_token = ct_token.unsqueeze(1)               # [B, 1, d_model]
+
+            # 记忆原型 tokens: [B, num_classes, d_model]
+            B = ct_token.size(0)
+            mem_tokens = self.prototype_memory.unsqueeze(0).expand(B, -1, -1).float()
+
+            # Dual-path Transformer 交互（内部全是 fp32）
+            ct_token, mem_tokens = self.dual_block(ct_token, mem_tokens)
+
+            # 用更新后的 ct_token 做分类
+            ct_token = ct_token.squeeze(1)                 # [B, d_model]
+            cls_logits = self.cls_out(ct_token)            # [B, cls_num_classes], fp32
+
         return cls_logits
+
+
