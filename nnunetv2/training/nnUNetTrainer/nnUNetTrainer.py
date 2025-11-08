@@ -1335,7 +1335,7 @@ class nnUNetTrainer(object):
                 # seg + cls 一起训，保持你之前的实现（早期多给一点 cls）
 
                 self.lambda_seg = 1
-                self.lambda_cls = 0.5
+                self.lambda_cls = 0.3
 
                 # seg_loss 内部已经处理 deep supervision（DeepSupervisionWrapper）
                 l_seg = self.seg_loss(output_seg, target_seg)
@@ -1988,7 +1988,7 @@ class nnUNetTrainer(object):
 # Plan
 # nnUNetv2_plan_and_preprocess -d 002 -pl nnUNetPlannerResEncM
 # train
-# nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans 
+# nnUNetv2_train 002 3d_fullres 5 -p nnUNetResEncUNetMPlans 
 # train cls
 # nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans -pretrained_weights F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\bestsig\20251107_best3.pth
 
