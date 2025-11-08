@@ -1,409 +1,231 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Union, List, Type
+from typing import Union, List, Tuple, Type
 
-# ---------------------------------------------------------------------
-# 1. 导入 nnU-Net v2 的核心构建模块
-# ---------------------------------------------------------------------
-from dynamic_network_architectures.building_blocks.residual import StackedResidualBlocks, BasicBlockD
-from dynamic_network_architectures.building_blocks.simple_conv_blocks import StackedConvBlocks
-from dynamic_network_architectures.building_blocks.helper import get_matching_convtransp
-
-# ---------------------------------------------------------------------
-# 2. （保留但当前没用的 CrossAttentionPooling / ClassificationHead）
-#    你现在的实现没有用到 transformer，可以先留在文件里不影响
-# ---------------------------------------------------------------------
-class CrossAttentionPooling(nn.Module):
-    def __init__(self, embed_dim, query_num, num_classes, num_heads=4, dropout=0.0):
-        super(CrossAttentionPooling, self).__init__()
-        self.embed_dim = embed_dim
-        self.num_classes = num_classes
-        self.query_num = query_num
-        self.class_query = nn.Parameter(torch.randn(query_num, embed_dim))
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=embed_dim, num_heads=num_heads, dropout=dropout, batch_first=False
-        )
-        self.norm = nn.LayerNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Linear(query_num * embed_dim, num_classes)
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.class_query)
-        nn.init.xavier_uniform_(self.classifier.weight)
-        nn.init.constant_(self.classifier.bias, 0)
-
-    def forward(self, x):
-        b = x.shape[0]
-        if x.dim() == 5:
-            x = x.flatten(2)
-        x = x.permute(2, 0, 1)  # [L, B, D]
-        query = self.class_query.unsqueeze(1).repeat(1, b, 1)  # [Q, B, D]
-        attended, _ = self.cross_attention(query=query, key=x, value=x)
-        attended = self.norm(attended)
-        attended = self.dropout(attended)
-        attended_permuted = attended.permute(1, 0, 2)  # [B, Q, D]
-        attended_flatten = attended_permuted.flatten(1)  # [B, Q*D]
-        return self.classifier(attended_flatten)
+from dynamic_network_architectures.architectures.unet import ResidualEncoderUNet
+from dynamic_network_architectures.building_blocks.residual import BasicBlockD, BottleneckD
+from dynamic_network_architectures.initialization.weight_init import (
+    InitWeights_He, init_last_bn_before_add_to_0
+)
 
 
-class ClassificationHead(nn.Module):
-    def __init__(self, embed_dim, query_num, num_classes, dropout=0.0,
-                 use_cross_attention=True, num_heads=4):
-        super(ClassificationHead, self).__init__()
-        if use_cross_attention:
-            self.pooling = CrossAttentionPooling(
-                embed_dim, query_num, num_classes, num_heads, dropout
-            )
-        else:
-            self.pooling = nn.Sequential(
-                nn.AdaptiveAvgPool3d(1),
-                nn.Flatten(1),
-                nn.Dropout(dropout),
-                nn.Linear(embed_dim, num_classes)
-            )
-
-    def forward(self, x):
-        return self.pooling(x)
-
-# ---------------------------------------------------------------------
-# 3. 多任务模型 + 模式内置冻结逻辑
-# ---------------------------------------------------------------------
-
-class ResNet_MTL_nnUNet(nn.Module):
+class ResNet_MTL_nnUNet(ResidualEncoderUNet):
     """
+    seg 分支：完全使用原版 ResidualEncoderUNet 的 encoder + UNetDecoder
+    cls 分支：读取 encoder 倒数两层特征 + seg 最终 logits，做 mask 引导 + attention 融合，再接两层 MLP 分类头
+
     task_mode:
-      - 'both'     : seg + cls 都训练
-      - 'seg_only' : 只训练 segmentation，cls 头前向但不产生梯度
-      - 'cls_only' : 只训练 classification，encoder + decoder + seg head 不产生梯度，
-                     且 cls 分支梯度不会回流到 encoder
+      - 'seg_only' : 只训 seg（cls 分支 no_grad）
+      - 'both'     : seg + cls 一起训
+      - 'cls_only' : 只训 cls（encoder/decoder no_grad）
     """
     def __init__(
         self,
-        # --- 必需参数 (无默认值) ---
+        # --- 这部分必须和 plans 里的 ResidualEncoderUNet 完全对齐 ---
         input_channels: int,
         n_stages: int,
-        features_per_stage: Tuple[int, ...],
+        features_per_stage: Union[int, List[int], Tuple[int, ...]],
         conv_op: Type[nn.Module],
-        kernel_sizes: Union[int, Tuple[int, ...], Tuple[Tuple[int, ...], ...]],
-        strides: Union[int, Tuple[int, ...], Tuple[Tuple[int, ...], ...]],
-        n_blocks_per_stage: Union[int, Tuple[int, ...], Tuple[Tuple[int, ...], ...]],
-        num_classes: int,  # segmentation 类别数
-        n_conv_per_stage_decoder: Union[int, Tuple[int, ...], Tuple[Tuple[int, ...], ...]],
-
-        # classification 类别数
-        cls_num_classes: int,
-
-        # --- 可选参数 ---
+        kernel_sizes: Union[int, List[int], Tuple[int, ...]],
+        strides: Union[int, List[int], Tuple[int, ...]],
+        n_blocks_per_stage: Union[int, List[int], Tuple[int, ...]],
+        num_classes: int,
+        n_conv_per_stage_decoder: Union[int, List[int], Tuple[int, ...]],
         conv_bias: bool = False,
-        norm_op: Type[nn.Module] = nn.InstanceNorm3d,
+        norm_op: Union[None, Type[nn.Module]] = None,
         norm_op_kwargs: dict = None,
-        dropout_op: Type[nn.Module] = nn.Dropout3d,
+        dropout_op: Union[None, Type[nn.Module]] = None,
         dropout_op_kwargs: dict = None,
-        nonlin: Type[nn.Module] = nn.LeakyReLU,
+        nonlin: Union[None, Type[nn.Module]] = None,
         nonlin_kwargs: dict = None,
-        deep_supervision: bool = True,
-
-        # ResNet 相关
-        block: Type[nn.Module] = BasicBlockD,
+        deep_supervision: bool = False,
+        block: Union[Type[BasicBlockD], Type[BottleneckD]] = BasicBlockD,
+        bottleneck_channels: Union[int, List[int], Tuple[int, ...]] = None,
         stem_channels: int = None,
-
-        # 分类头相关（部分暂时不用）
-        cls_query_num: int = 16,
-        cls_dropout: float = 0.0,
-        use_cross_attention: bool = False,
-        cls_num_heads: int = 4,
-
-        # 任务模式
-        task_mode: str = 'cls_only',
+        # --- 额外：分类相关 ---
+        cls_num_classes: int = 3,
+        task_mode: str = 'seg_only',
+        cls_dropout: float = 0.3,
     ):
-        super().__init__()
+        super().__init__(
+            input_channels=input_channels,
+            n_stages=n_stages,
+            features_per_stage=features_per_stage,
+            conv_op=conv_op,
+            kernel_sizes=kernel_sizes,
+            strides=strides,
+            n_blocks_per_stage=n_blocks_per_stage,
+            num_classes=num_classes,
+            n_conv_per_stage_decoder=n_conv_per_stage_decoder,
+            conv_bias=conv_bias,
+            norm_op=norm_op,
+            norm_op_kwargs=norm_op_kwargs,
+            dropout_op=dropout_op,
+            dropout_op_kwargs=dropout_op_kwargs,
+            nonlin=nonlin,
+            nonlin_kwargs=nonlin_kwargs,
+            deep_supervision=deep_supervision,
+            block=block,
+            bottleneck_channels=bottleneck_channels,
+            stem_channels=stem_channels,
+        )
 
-        # 记录任务模式
-        assert task_mode in ('both', 'seg_only', 'cls_only')
+        assert task_mode in ('seg_only', 'both', 'cls_only')
         self.task_mode = task_mode
+        self.cls_num_classes = cls_num_classes
+        self.num_classes = num_classes  # seg 类别数（含背景），后面做 mask 用
 
-        # 规范 nnU-Net 参数
-        if isinstance(n_blocks_per_stage, int):
-            n_blocks_per_stage = [n_blocks_per_stage] * n_stages
-        if isinstance(n_conv_per_stage_decoder, int):
-            n_conv_per_stage_decoder = [n_conv_per_stage_decoder] * (n_stages - 1)
-        if norm_op_kwargs is None:
-            norm_op_kwargs = {'eps': 1e-5, 'affine': True}
-        if nonlin_kwargs is None:
-            nonlin_kwargs = {'inplace': True}
+        # --- encoder multi-scale 通道数 ---
+        if isinstance(features_per_stage, int):
+            feat_list = [features_per_stage] * n_stages
+        else:
+            feat_list = list(features_per_stage)
+        assert len(feat_list) >= 2, "需要至少两层 encoder 以做 multi-scale 分类特征"
+        enc_ch_last = feat_list[-1]
+        enc_ch_second_last = feat_list[-2]
 
-        self.deep_supervision = deep_supervision
-        self.num_classes = num_classes
-        self.n_stages = n_stages
+        # 分类特征维度 = 倒数两层 encoder 通道之和
+        self.cls_feat_dim = enc_ch_last + enc_ch_second_last
 
-        # ---------------------------------
-        # 1. Encoder (ResNet)
-        # ---------------------------------
-        self.conv_encoder_blocks = nn.ModuleList()
-        if stem_channels is None:
-            stem_channels = features_per_stage[0]
-
-        # stem
-        self.conv_encoder_blocks.append(
-            StackedResidualBlocks(
-                n_blocks_per_stage[0], conv_op, input_channels, stem_channels,
-                kernel_sizes[0], strides[0], conv_bias,
-                norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs,
-                nonlin, nonlin_kwargs, block=block
-            )
-        )
-        # 后续 stage
-        for s in range(1, n_stages):
-            self.conv_encoder_blocks.append(
-                StackedResidualBlocks(
-                    n_blocks_per_stage[s], conv_op,
-                    features_per_stage[s - 1], features_per_stage[s],
-                    kernel_sizes[s], strides[s], conv_bias,
-                    norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs,
-                    nonlin, nonlin_kwargs, block=block
-                )
-            )
-
-        # ---------------------------------
-        # 2. Segmentation Decoder
-        # ---------------------------------
-        self.transpconvs = nn.ModuleList()
-        self.decoder_blocks = nn.ModuleList()
-        self.seg_layers = nn.ModuleList()
-        transpconv_op = get_matching_convtransp(conv_op)
-
-        for s in range(n_stages - 1, 0, -1):
-            self.transpconvs.append(
-                transpconv_op(
-                    features_per_stage[s], features_per_stage[s - 1],
-                    strides[s], strides[s], bias=conv_bias
-                )
-            )
-            decoder_input_features = 2 * features_per_stage[s - 1]
-            self.decoder_blocks.append(
-                StackedConvBlocks(
-                    n_conv_per_stage_decoder[s - 1], conv_op,
-                    decoder_input_features, features_per_stage[s - 1],
-                    kernel_sizes[s - 1], 1, conv_bias,
-                    norm_op, norm_op_kwargs, dropout_op, dropout_op_kwargs,
-                    nonlin, nonlin_kwargs
-                )
-            )
-            self.seg_layers.append(
-                conv_op(features_per_stage[s - 1], num_classes, 1, 1, 0, bias=True)
-            )
-
-        # ---------------------------------
-        # 3. Classification 分支
-        #    输入 = bottleneck GAP + decoder 最后一层 GAP + lesion-masked GAP(decoder)
-        #    向量维度 = C_bottleneck + 2 * C_decoder_last
-        # ---------------------------------
-        self.bottleneck_channels = features_per_stage[-1]
-        self.decoder_last_channels = features_per_stage[0]     # 最高分辨率 decoder 的通道数
-        self.cls_input_dim = (
-            self.bottleneck_channels               # bottleneck 全局池化
-            + self.decoder_last_channels           # decoder 全局池化
-            + self.decoder_last_channels           # decoder lesion-masked 池化
+        # attention：输入 [f_global, f_region] 拼接后的 2*dim，输出两个权重（global / region）
+        self.attention_fuse = nn.Sequential(
+            nn.Linear(self.cls_feat_dim * 2, 2),
+            nn.Softmax(dim=1)
         )
 
-        hidden_dim1 = self.cls_input_dim // 2
-        hidden_dim2 = max(self.cls_input_dim // 4, cls_num_classes * 2)  # 稍微防止太小
-
+        # 两层 MLP 分类头
+        hidden_dim = max(self.cls_feat_dim // 2, cls_num_classes * 2)
         self.classification_head = nn.Sequential(
-            nn.Linear(self.cls_input_dim, hidden_dim1),
+            nn.Linear(self.cls_feat_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.2),
-            nn.Linear(hidden_dim1, hidden_dim2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.2),
-            nn.Linear(hidden_dim2, cls_num_classes)
+            nn.Dropout(p=cls_dropout),
+            nn.Linear(hidden_dim, cls_num_classes),
         )
 
+        # 初始化：沿用 nnUNet 风格（相当于对整个网络做 He init）
+        InitWeights_He(1e-2)(self)
+        init_last_bn_before_add_to_0(self)
 
-    # ======== 一些小工具函数 ========
-
+    # ---- 小工具：外部可以随时切模式 ----
     def set_task_mode(self, mode: str):
-        """外部可以随时切模式，例如 net.set_task_mode('seg_only')"""
-        assert mode in ('both', 'seg_only', 'cls_only')
+        assert mode in ('seg_only', 'both', 'cls_only')
         self.task_mode = mode
 
-    # segmentation 分支前向（不关心梯度，在外层控制）
-    def _forward_seg_branch(self, bottleneck_features, skips):
+    # ---- 主 forward：严格保持 seg 路径与原生 ResidualEncoderUNet 一致 ----
+    def forward(self, x, task_mode: str = None):
         """
-        返回:
-          seg_output_return: deep supervision 的输出（或单一输出）
-          decoder_last_features: 最高分辨率 decoder block 的特征，用于 cls 头
-        """
-        seg_outputs = []
-        x_dec = bottleneck_features
-        for i in range(len(self.decoder_blocks)):
-            skip_connection = skips[-(i + 2)]
-            x_dec = self.transpconvs[i](x_dec)
-            x_dec = torch.cat((x_dec, skip_connection), dim=1)
-            x_dec = self.decoder_blocks[i](x_dec)
-            seg_outputs.append(self.seg_layers[i](x_dec))
-
-        if self.deep_supervision:
-            seg_output_return = seg_outputs[::-1]  # seg_output_return[0] 是最高分辨率
-        else:
-            seg_output_return = seg_outputs[-1]
-
-        decoder_last_features = x_dec  # 最高分辨率 decoder 特征
-        return seg_output_return, decoder_last_features
-
-
-    # classification 分支前向（输入是某个 feature map）
-    def _forward_cls_branch(self,
-                            bottleneck_features: torch.Tensor,
-                            decoder_last_features: torch.Tensor,
-                            seg_output) -> torch.Tensor:
-        """
-        bottleneck_features: [B, Cb, D, H, W]
-        decoder_last_features: [B, Cd, D, H, W]  (最高分辨率 decoder 特征)
-        seg_output: deep supervision 列表或单一 logits，用于构造 lesion mask
-        """
-        # 1) 取最高分辨率 seg logits
-        if isinstance(seg_output, (list, tuple)):
-            seg_logits = seg_output[0]      # deep supervision 时，第一个是最高分辨率
-        else:
-            seg_logits = seg_output         # [B, K, D, H, W]
-
-        # 2) 全局平均池化 bottleneck 和 decoder_last
-        v_enc = bottleneck_features.mean(dim=(2, 3, 4))            # [B, Cb]
-        v_dec_global = decoder_last_features.mean(dim=(2, 3, 4))   # [B, Cd]
-
-        # 3) 用 seg 输出做 lesion soft mask pooling（非 0 类都当作 lesion）
-        probs = torch.softmax(seg_logits, dim=1)                   # [B, K, D, H, W]
-        if probs.shape[1] > 1:
-            lesion_mask = probs[:, 1:, ...].sum(dim=1, keepdim=True)  # [B,1,D,H,W]
-        else:
-            lesion_mask = probs                                     # 退化情况
-
-        lesion_sum = lesion_mask.sum(dim=(2, 3, 4))                # [B, 1]
-        # 避免空 lesion 时除零
-        v_dec_lesion = (decoder_last_features * lesion_mask).sum(dim=(2, 3, 4)) / (
-            lesion_sum + 1e-6
-        )                                                          # [B, Cd]
-
-        # 4) 拼接成 cls 向量: [Cb + Cd + Cd]
-        cls_vec = torch.cat([v_enc, v_dec_global, v_dec_lesion], dim=1)  # [B, cls_input_dim]
-
-        # 5) 3 层线性 + Dropout(0.2)
-        out = self.classification_head(cls_vec)                    # [B, cls_num_classes]
-        return out
-
-
-    # ======== 主 forward，内置模式控制梯度 ========
-
-    def forward(self, x: torch.Tensor,
-                task_mode: str = None) -> Tuple[Union[torch.Tensor, List[torch.Tensor]], torch.Tensor]:
-        """
-        x: [B, C, D, H, W]
-        task_mode: 可选覆盖 self.task_mode；不传就用当前对象的 task_mode
+        seg 分支严格保持：
+            skips = self.encoder(x)
+            seg   = self.decoder(skips)
         """
         mode = task_mode if task_mode is not None else self.task_mode
-        assert mode in ('both', 'seg_only', 'cls_only')
+        assert mode in ('seg_only', 'both', 'cls_only')
 
-        # 1. Encoder
-        skips: List[torch.Tensor] = []
-        x_enc = x
-        for i in range(self.n_stages):
-            x_enc = self.conv_encoder_blocks[i](x_enc)
-            skips.append(x_enc)
-        bottleneck_features = skips[-1]
-
-                # 2. Segmentation 路径
+        # ---- encoder + decoder ----
         if mode == 'cls_only':
-            # 只训分类：seg 路径不参与梯度
+            # 只做分类：encoder/decoder 不要梯度
             with torch.no_grad():
-                seg_output, decoder_last_features = self._forward_seg_branch(bottleneck_features, skips)
+                skips = self.encoder(x)
+                seg_output = self.decoder(skips)
         else:
-            # both / seg_only：seg 正常产生梯度
-            seg_output, decoder_last_features = self._forward_seg_branch(bottleneck_features, skips)
+            # seg_only / both：正常训练 seg 分支
+            skips = self.encoder(x)
+            seg_output = self.decoder(skips)
 
-        # 3. Classification 路径
+        bottleneck_features = skips[-1]   # 最深层
+        second_last_features = skips[-2]  # 倒数第二层
+
+        # ---- 分类分支 ----
         if mode == 'seg_only':
-            # 只训 seg：cls 分支只做前向，无梯度
+            # 只训 seg：分类头 no_grad，完全不更新 cls 参数
             with torch.no_grad():
                 cls_output = self._forward_cls_branch(
                     bottleneck_features,
-                    decoder_last_features,
+                    second_last_features,
                     seg_output
                 )
         elif mode == 'cls_only':
-            # 只训 cls：不让梯度回到 encoder/decoder，只更新分类头
-            bottleneck_detached = bottleneck_features.detach()
-            decoder_last_detached = decoder_last_features.detach()
-            cls_output = self._forward_cls_branch(
-                bottleneck_detached,
-                decoder_last_detached,
-                seg_output      # seg_output 本身已经 no_grad
-            )
-        else:
-            # both：seg + cls 都回传到 encoder/decoder
+            # 只训 cls：encoder/decoder 在上面已经 no_grad，这里可以直接 forward
             cls_output = self._forward_cls_branch(
                 bottleneck_features,
-                decoder_last_features,
+                second_last_features,
+                seg_output
+            )
+        else:  # both
+            cls_output = self._forward_cls_branch(
+                bottleneck_features,
+                second_last_features,
                 seg_output
             )
 
         return seg_output, cls_output
 
+    # ---- 分类分支：multi-scale + mask 引导 + attention 融合 ----
+    def _forward_cls_branch(self,
+                            bottleneck_features: torch.Tensor,
+                            second_last_features: torch.Tensor,
+                            seg_output):
+        """
+        bottleneck_features: encoder 最后一层特征 [B, Cb, D_b, H_b, W_b]
+        second_last_features: encoder 倒数第二层特征 [B, Cs, D_s, H_s, W_s]
+        seg_output: decoder 输出 logits（deep supervision 时为 list/tuple）
+        """
+        # 1) 取最终 seg logits（高分辨率）
+        if isinstance(seg_output, (list, tuple)):
+            seg_logits = seg_output[0]   # nnUNet deep supervision: index 0 通常是最高分辨率
+        else:
+            seg_logits = seg_output      # [B, K, D, H, W]
 
+        # 2) multi-scale global pooling（不看 mask）
+        f_global_last = bottleneck_features.mean(dim=(2, 3, 4))      # [B, Cb]
+        f_global_second = second_last_features.mean(dim=(2, 3, 4))   # [B, Cs]
+        f_global = torch.cat([f_global_last, f_global_second], dim=1)  # [B, cls_feat_dim]
 
-# ---------------------------------------------------------------------
-# 简单自测
-# ---------------------------------------------------------------------
-if __name__ == '__main__':
-    import os
-    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 3) 从 seg logits 生成前景概率掩膜
+        if self.num_classes > 1:
+            prob = torch.softmax(seg_logits, dim=1)                  # [B, K, D, H, W]
+            # 假设通道 1..K-1 都是 foreground，全部加起来
+            if prob.shape[1] > 1:
+                fg_prob = prob[:, 1:, ...].sum(dim=1, keepdim=True)  # [B,1,D,H,W]
+            else:
+                fg_prob = prob                                       # 退化情况
+        else:
+            # 单通道 seg（logits），用 sigmoid
+            fg_prob = torch.sigmoid(seg_logits)                      # [B,1,D,H,W]（K=1）
 
-    seg_classes = 14
-    cls_classes = 3
+        # 4) 下采样 mask 到 encoder 倒数 1/2 层
+        B, _, D_b, H_b, W_b = bottleneck_features.shape
+        _, _, D_s, H_s, W_s = second_last_features.shape
 
-    unet_config = {
-        "input_channels": 1,
-        "n_stages": 6,
-        "features_per_stage": (32, 64, 128, 256, 320, 320),
-        "conv_op": nn.Conv3d,
-        "kernel_sizes": ((3, 3, 3),) * 6,
-        "strides": ((1, 1, 1), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)),
-        "n_blocks_per_stage": (2, 2, 2, 2, 2, 2),
-        "num_classes": seg_classes,
-        "n_conv_per_stage_decoder": (2, 2, 2, 2, 2),
-        "conv_bias": True,
-        "norm_op": nn.InstanceNorm3d,
-        "norm_op_kwargs": {"eps": 1e-05, "affine": True},
-        "dropout_op": None,
-        "dropout_op_kwargs": None,
-        "nonlin": nn.LeakyReLU,
-        "nonlin_kwargs": {"inplace": True},
-        "deep_supervision": True,
-        "block": BasicBlockD,
-    }
+        mask_last = F.interpolate(
+            fg_prob, size=(D_b, H_b, W_b),
+            mode='trilinear', align_corners=False
+        )
+        mask_second = F.interpolate(
+            fg_prob, size=(D_s, H_s, W_s),
+            mode='trilinear', align_corners=False
+        )
 
-    model = ResNet_MTL_nnUNet(
-        **unet_config,
-        cls_num_classes=cls_classes,
-        cls_query_num=16,
-        cls_dropout=0.1,
-        use_cross_attention=False,
-        task_mode='both',
-    ).to(device)
+        # 5) mask 引导的平均池化（只在前景区域求均值）
+        def masked_avg(feat: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6):
+            masked = feat * mask
+            num = masked.sum(dim=(2, 3, 4))          # [B,C]
+            den = mask.sum(dim=(2, 3, 4)).clamp_min(eps)  # [B,1]
+            return num / den
 
-    dummy_input = torch.randn(2, 1, 128, 128, 128).to(device)
+        f_region_last = masked_avg(bottleneck_features, mask_last)       # [B, Cb]
+        f_region_second = masked_avg(second_last_features, mask_second)  # [B, Cs]
+        f_region = torch.cat([f_region_last, f_region_second], dim=1)    # [B, cls_feat_dim]
 
-    with torch.no_grad():
-        seg_output, class_output = model(dummy_input)
+        # 6) attention 融合 global / region 两路特征
+        #    根据 concat([f_global, f_region]) 预测 [w_global, w_region]，softmax 后加权求和
+        concat_features = torch.cat([f_global, f_region], dim=1)         # [B, 2*cls_feat_dim]
+        weights = self.attention_fuse(concat_features)                   # [B,2]
+        w_global = weights[:, 0:1]                                       # [B,1]
+        w_region = weights[:, 1:2]                                       # [B,1]
+        fused = w_global * f_global + w_region * f_region                # [B, cls_feat_dim]
 
-    print(f"Input shape: {dummy_input.shape}")
-    print(f"Classification output shape: {class_output.shape}")
-    print("Segmentation outputs (Deep Supervision):")
-    if isinstance(seg_output, list):
-        for i, out in enumerate(seg_output):
-            print(f"  Level {i}: {out.shape}")
-    else:
-        print(f"  Output shape: {seg_output.shape}")
+        # 7) MLP 分类头
+        cls_logits = self.classification_head(fused)                     # [B, cls_num_classes]
+        return cls_logits

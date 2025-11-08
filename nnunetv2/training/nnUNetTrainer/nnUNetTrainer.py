@@ -155,9 +155,9 @@ class nnUNetTrainer(object):
         self.weight_decay = 3e-5
         self.oversample_foreground_percent = 0.33
         self.probabilistic_oversampling = False
-        self.num_iterations_per_epoch = 250
+        self.num_iterations_per_epoch = 250 
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 200
         self.current_epoch = 0
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
@@ -329,44 +329,73 @@ class nnUNetTrainer(object):
             dct['cudnn_version'] = cudnn_version
             save_json(dct, join(self.output_folder, "debug.json"))
 
+    # @staticmethod
+    # def build_network_architecture(architecture_class_name: str,
+    #                                  arch_init_kwargs: dict,
+    #                                  arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+    #                                  num_input_channels: int,
+    #                                  num_output_channels: int,
+    #                                  task_mode: str,
+    #                                  enable_deep_supervision: bool = True
+    #                                  ) -> nn.Module:
+    #     """
+    #     此方法被重写，以直接加载自定义的 ResNet_MTL_nnUNet 模型，
+    #     模仿 nnXNetTrainer 的方式。
+    #     """
+    #     import pydoc  # 像范例中一样，在这里导入 pydoc
+
+    #     # 1. 复制从 plans 文件加载的架构参数
+    #     architecture_kwargs = dict(**arch_init_kwargs)
+
+    #     # 2. 将字符串 (例如 'nn.InstanceNorm3d') 转换为类
+    #     for ri in arch_init_kwargs_req_import:
+    #         if architecture_kwargs[ri] is not None:
+    #             architecture_kwargs[ri] = pydoc.locate(architecture_kwargs[ri])
+
+    #     # 3. 直接实例化你的自定义模型
+    #     # 注意：
+    #     # - `num_output_channels` 被传递给 `num_classes` (分割头)
+    #     # - `cls_num_classes` 预计存在于 `architecture_kwargs` 中 (从 plans.json 加载)
+    #     network = ResNet_MTL_nnUNet(
+    #         input_channels=num_input_channels,
+    #         num_classes=num_output_channels,  # 分割头的类别数
+    #         deep_supervision=enable_deep_supervision,
+    #         cls_num_classes=3,
+    #         task_mode=task_mode,
+    #         **architecture_kwargs  # 解包所有来自 plans 文件的参数
+    #                                  # (例如 n_stages, features_per_stage, block, cls_num_classes 等)
+    #     )
+
+    #     return network
+
     @staticmethod
     def build_network_architecture(architecture_class_name: str,
-                                     arch_init_kwargs: dict,
-                                     arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
-                                     num_input_channels: int,
-                                     num_output_channels: int,
-                                     task_mode: str,
-                                     enable_deep_supervision: bool = True
-                                     ) -> nn.Module:
-        """
-        此方法被重写，以直接加载自定义的 ResNet_MTL_nnUNet 模型，
-        模仿 nnXNetTrainer 的方式。
-        """
-        import pydoc  # 像范例中一样，在这里导入 pydoc
+                                arch_init_kwargs: dict,
+                                arch_init_kwargs_req_import,
+                                num_input_channels: int,
+                                num_output_channels: int,
+                                task_mode: str,
+                                enable_deep_supervision: bool = True) -> nn.Module:
+        import pydoc
 
-        # 1. 复制从 plans 文件加载的架构参数
         architecture_kwargs = dict(**arch_init_kwargs)
-
-        # 2. 将字符串 (例如 'nn.InstanceNorm3d') 转换为类
         for ri in arch_init_kwargs_req_import:
             if architecture_kwargs[ri] is not None:
                 architecture_kwargs[ri] = pydoc.locate(architecture_kwargs[ri])
 
-        # 3. 直接实例化你的自定义模型
-        # 注意：
-        # - `num_output_channels` 被传递给 `num_classes` (分割头)
-        # - `cls_num_classes` 预计存在于 `architecture_kwargs` 中 (从 plans.json 加载)
-        network = ResNet_MTL_nnUNet(
+        # arch_init_kwargs 里其实就是 ResidualEncoderUNet 那些字段：
+        # n_stages, features_per_stage, conv_op, kernel_sizes, strides, n_blocks_per_stage, ...
+        net = ResNet_MTL_nnUNet(
             input_channels=num_input_channels,
-            num_classes=num_output_channels,  # 分割头的类别数
+            num_classes=num_output_channels,         # seg 头类别数
             deep_supervision=enable_deep_supervision,
-            cls_num_classes=3,
             task_mode=task_mode,
-            **architecture_kwargs  # 解包所有来自 plans 文件的参数
-                                     # (例如 n_stages, features_per_stage, block, cls_num_classes 等)
+            cls_num_classes=3,                       # 你自己的分类数
+            **architecture_kwargs
         )
 
-        return network
+        return net
+
 
     def _get_deep_supervision_scales(self):
         if self.enable_deep_supervision:
@@ -1302,12 +1331,9 @@ class nnUNetTrainer(object):
 
             else:  # mode == 'both'
                 # seg + cls 一起训，保持你之前的实现（早期多给一点 cls）
-                if self.current_epoch < 20:
-                    self.lambda_seg = 0.3
-                    self.lambda_cls = 1.0
-                else:
-                    self.lambda_seg = 0.2
-                    self.lambda_cls = 1.0
+
+                self.lambda_seg = 1
+                self.lambda_cls = 0.5
 
                 # seg_loss 内部已经处理 deep supervision（DeepSupervisionWrapper）
                 l_seg = self.seg_loss(output_seg, target_seg)
@@ -1574,7 +1600,14 @@ class nnUNetTrainer(object):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
 
     def on_epoch_end(self):
-        self.debug_check_param("cls_adapter")
+        # 看 encoder bottleneck
+        self.debug_check_param("conv_encoder_blocks.5")   # 最后一层 encoder
+
+        # 看 decoder 最后一层
+        self.debug_check_param("decoder_blocks.0")        # 最靠近输出的 decoder block
+
+        # 看分类头
+        self.debug_check_param("classification_head.0")
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
         # --- GAI: 打印所有训练和验证损失 ---
@@ -1955,7 +1988,7 @@ class nnUNetTrainer(object):
 # train
 # nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans 
 # train cls
-# nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans -pretrained_weights F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\bestsig\20251105_bestseg.pth
+# nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans -pretrained_weights F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\bestsig\20251107_best3.pth
 
 # predict
 # nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 5
