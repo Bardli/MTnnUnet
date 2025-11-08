@@ -161,7 +161,7 @@ class nnUNetTrainer(object):
         self.current_epoch = 0
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
-        self.task_mode = 'cls_only'
+        self.task_mode = 'both'
         print(f"Task mode set to {self.task_mode}")
         self.cls_patch_size = (96, 160, 224)
 
@@ -1348,7 +1348,7 @@ class nnUNetTrainer(object):
                 # seg + cls 一起训，保持你之前的实现（早期多给一点 cls）
 
                 self.lambda_seg = 1
-                self.lambda_cls = 0.3
+                self.lambda_cls = 0.03
 
                 # seg_loss 内部已经处理 deep supervision（DeepSupervisionWrapper）
                 l_seg = self.seg_loss(output_seg, target_seg)
@@ -1360,7 +1360,7 @@ class nnUNetTrainer(object):
                     seg_hires = target_seg        # (B, D, H, W)
 
                 # 简单假设：>0 就算 lesion
-                lesion_mask  = (seg_hires > 0)
+                lesion_mask  = (seg_hires == 2)
                 has_lesion = lesion_mask.view(lesion_mask.shape[0], -1).any(dim=1)   # (B,) bool
 
                 if has_lesion.any():
@@ -2069,6 +2069,8 @@ if __name__ == "__main__":
     trainer.lambda_cls = 1.0
     trainer.seg_loss = nn.CrossEntropyLoss()
     trainer.cls_loss = nn.CrossEntropyLoss()
+
+
 
     # ===============================================================
     # 3️⃣ 构造假数据

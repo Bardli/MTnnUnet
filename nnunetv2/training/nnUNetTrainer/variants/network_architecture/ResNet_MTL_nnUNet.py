@@ -73,8 +73,8 @@ class DualPathTransformerBlock(nn.Module):
         mem_tokens: torch.Tensor  # [B, M, D]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # === 强制用 float32，避免 AMP 下 multiheadattention 溢出 ===
-        ct_token = ct_token.float()
-        mem_tokens = mem_tokens.float()
+        # ct_token = ct_token.float()
+        # mem_tokens = mem_tokens.float()
 
         # ----- 路径1: ct <- mem -----
         ct_res = ct_token
@@ -243,49 +243,67 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
             seg_output = self.decoder(skips)
 
         # 分类分支
+
         if mode == 'seg_only':
             with torch.no_grad():
-                cls_output = self._forward_cls_branch(skips)
+                # seg_output 已经在 no_grad 上下文中
+                cls_output = self._forward_cls_branch(skips, seg_output)
         elif mode == 'cls_only':
-            cls_output = self._forward_cls_branch(skips)
+                # 冻结 encoder 和 decoder 的特征
+            skips_detached = [s.detach() for s in skips]
+            # seg_output 已经在 no_grad 上下文中计算，自带 no_grad 属性
+            cls_output = self._forward_cls_branch(skips_detached, seg_output)
         else:  # both
-            cls_output = self._forward_cls_branch(skips)
+            # 梯度流经 encoder, decoder, 和 cls_branch
+            cls_output = self._forward_cls_branch(skips, seg_output)
 
         return seg_output, cls_output
 
     # ---- 分类分支：多尺度 pooling + Dual-path Transformer + 记忆原型 ----
-    def _forward_cls_branch(self, skips: List[torch.Tensor]) -> torch.Tensor:
-        """
-        skips: encoder 各 stage 输出
-        """
-        # === 整个分类分支强制用 float32，避开 AMP 溢出 ===
-        with autocast_cuda('cuda',enabled=False):
-            pooled_feats = []
-            for feat in skips:
-                # 先转 float32，再做 pooling（有些 encoder 输出可能是 half）
-                feat = feat.float()
-                pooled = F.adaptive_max_pool3d(feat, output_size=1)  # [B, C, 1, 1, 1]
-                pooled = pooled.view(pooled.size(0), -1)             # [B, C]
-                pooled_feats.append(pooled)
+    def _forward_cls_branch(self, skips, seg_output):
+        # 1. 获取 seg_logits (必须转 float32
+        if isinstance(seg_output, (list, tuple)):
+            seg_logits = seg_output[0].float()
+        else:
+            seg_logits = seg_output.float()
 
-            # 拼接多尺度特征: [B, cls_feat_dim]
-            multi_scale_feat = torch.cat(pooled_feats, dim=1).float()
+        # 2. 生成掩码 (并 detach!)
+        probs = F.softmax(seg_logits, dim=1)
+        lesion_mask_hires = probs[:, 2:3, ...].detach() # 阶段 5 修复
 
-            # 投到 d_model 维作为单个 CT token: [B, 1, d_model]
-            ct_token = self.ct_proj(multi_scale_feat)      # [B, d_model], fp32
-            ct_token = ct_token.unsqueeze(1)               # [B, 1, d_model]
+        # 3. Masked Pooling (feat 不再 .float())
+        pooled_feats = []
+        for feat in skips:
+            # feat = feat.float()  <-- 已删除
+            current_shape = feat.shape[2:]
+            lesion_mask_resized = F.interpolate(lesion_mask_hires, 
+                                                size=current_shape, 
+                                                mode='trilinear', 
+                                                align_corners=False)
+            feat_masked = feat * lesion_mask_resized
+            feat_sum_per_channel = feat_masked.sum(dim=(2, 3, 4))
+            mask_sum_per_channel = lesion_mask_resized.sum(dim=(2, 3, 4)) + 1e-6
+            pooled = feat_sum_per_channel / mask_sum_per_channel
+            pooled_feats.append(pooled)
 
-            # 记忆原型 tokens: [B, num_classes, d_model]
-            B = ct_token.size(0)
-            mem_tokens = self.prototype_memory.unsqueeze(0).expand(B, -1, -1).float()
+        # 4. 拼接 (不再 .float())
+        multi_scale_feat = torch.cat(pooled_feats, dim=1)
 
-            # Dual-path Transformer 交互（内部全是 fp32）
-            ct_token, mem_tokens = self.dual_block(ct_token, mem_tokens)
+        ct_token = self.ct_proj(multi_scale_feat)
+        ct_token = ct_token.unsqueeze(1)
 
-            # 用更新后的 ct_token 做分类
-            ct_token = ct_token.squeeze(1)                 # [B, d_model]
-            cls_logits = self.cls_out(ct_token)            # [B, cls_num_classes], fp32
+        B = ct_token.size(0)
+        # (不再 .float())
+        mem_tokens = self.prototype_memory.unsqueeze(0).expand(B, -1, -1) 
 
-        return cls_logits
+        # 5. Dual block
+        ct_token, mem_tokens = self.dual_block(ct_token, mem_tokens)
+
+        # 6. Output
+        ct_token = ct_token.squeeze(1)
+        cls_logits = self.cls_out(ct_token)
+
+        # 7. 返回 float32 的 logits
+        return cls_logits.float()
 
 
