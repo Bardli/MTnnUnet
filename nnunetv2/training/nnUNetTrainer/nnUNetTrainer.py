@@ -8,6 +8,7 @@ from copy import deepcopy
 from datetime import datetime
 from time import time, sleep
 from typing import Counter, Tuple, Union, List
+import torch.nn.functional as F
 
 import numpy as np
 import torch
@@ -36,13 +37,15 @@ from batchgeneratorsv2.transforms.utils.pseudo2d import Convert3DTo2DTransform, 
 from batchgeneratorsv2.transforms.utils.random import RandomTransform
 from batchgeneratorsv2.transforms.utils.remove_label import RemoveLabelTansform
 from batchgeneratorsv2.transforms.utils.seg_to_regions import ConvertSegmentationToRegionsTransform
-from torch import autocast, nn
+from torch import autocast, mode, nn
 from torch import distributed as dist
 from torch._dynamo import OptimizedModule
 from torch.cuda import device_count
 from torch import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from nnunetv2.training import lr_scheduler
+from nnunetv2.training.nnUNetTrainer.variants import optimizer
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
@@ -164,6 +167,15 @@ class nnUNetTrainer(object):
         self.task_mode = 'both'
         print(f"Task mode set to {self.task_mode}")
         self.cls_patch_size = (96, 160, 224)
+
+        # ===== BOTH 模式下分类 ROI 课程 & 损失权重（新增默认值） =====
+        self.roi_use_gt_epochs     = 60   # 前60个epoch用GT ROI，之后用预测ROI
+        self.lesion_label_value    = 2    # target_seg里“病灶”标签的整数值（你的数据是0/1/2→病灶=2）
+        self.lambda_seg_both       = 1.0  # BOTH模式分割损失权重
+        self.lambda_cls_both_start = 0.5  # 分类权重从0.5线性升到1.0（随epoch）
+        self.lambda_cls_both_end   = 1.0
+
+
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -390,7 +402,8 @@ class nnUNetTrainer(object):
             num_classes=num_output_channels,         # seg 头类别数
             deep_supervision=enable_deep_supervision,
             task_mode=task_mode,
-            cls_num_classes=3,                       # 你自己的分类数
+            cls_num_classes=3, 
+            lesion_channel_idx = 2,                                            # 你自己的分类数
             **architecture_kwargs
         )
 
@@ -577,14 +590,28 @@ class nnUNetTrainer(object):
             lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.num_epochs)
         
         else: # 'seg_only' or 'both'
-            self.print_to_log_file(f"Using {self.task_mode.upper()} mode: Optimizer=SGD, LR_Scheduler=PolyLRScheduler")
-            # 优化器（保持 nnUNet 默认）
-            optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
-                                        momentum=0.99, nesterov=True)
-            # 调度器（保持 nnUNet 默认）
-            lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
-            
+            enc_params, dec_params, cls_params = [], [], []
+            for n, p in self.network.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if 'encoder' in n:
+                    enc_params.append(p)
+                elif any(k in n for k in ['ct_proj', 'dual_block', 'cls_out']):
+                    cls_params.append(p)
+                else:
+                    dec_params.append(p)
+
+            optimizer = torch.optim.AdamW(
+                [
+                    {'params': enc_params, 'lr': 3e-4},
+                    {'params': dec_params, 'lr': 3e-4},
+                    {'params': cls_params, 'lr': 1e-3},   # 分类头更大一点
+                ],
+                weight_decay=1e-4
+    )
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.num_epochs)
         return optimizer, lr_scheduler
+
 
     def plot_network_architecture(self):
         if self._do_i_compile():
@@ -1328,7 +1355,39 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             # 网络返回 (seg_output, cls_output)
             # task_mode 的具体梯度逻辑在模型内部处理
-            output_seg, output_cls = self.network(data)
+            roi_mask_for_cls = None
+
+            if mode == 'both':
+                # 取最高分辨率的 GT 分割，并规范成 5D (B,1,D,H,W)
+                seg_hires = target_seg[0] if isinstance(target_seg, list) else target_seg
+                if seg_hires.ndim == 4:
+                    seg_hires_5d = seg_hires.unsqueeze(1)        # B×1×DHW
+                elif seg_hires.ndim == 5:
+                    seg_hires_5d = seg_hires                     # B×C×DHW 或 B×1×DHW
+                else:
+                    raise RuntimeError(f"Unexpected seg_hires ndim={seg_hires.ndim}, expect 4D or 5D.")
+
+                # 课程：前 N 个 epoch 用 GT ROI，之后用预测 ROI
+                roi_use_gt_epochs  = getattr(self, 'roi_use_gt_epochs', 30)
+
+                if self.current_epoch < roi_use_gt_epochs:
+                    # ★ 前景联合 ROI（非背景）：兼容 [bg, organ, lesion] 或 [bg, lesion]
+                    # 若是 one-hot，多通道>0 的位置都会被并进 ROI；若是 labelmap，(>0) 即非背景
+                    roi_mask_for_cls = (seg_hires_5d > 0).float()            # B×C?×DHW 或 B×1×DHW
+                    if roi_mask_for_cls.shape[1] != 1:                       # 若出现多通道 -> 聚合成单通道
+                        roi_mask_for_cls = (roi_mask_for_cls > 0).any(dim=1, keepdim=True).float()
+                    # 轻微膨胀，给分类更多上下文
+                    if getattr(self, 'cls_roi_dilate', True):
+                        roi_mask_for_cls = F.max_pool3d(roi_mask_for_cls, kernel_size=3, stride=1, padding=1)
+                    roi_mask_for_cls = roi_mask_for_cls.clamp_min(1e-3)
+                else:
+                    roi_mask_for_cls = None  # 切换到预测 ROI（模型内部会从 seg_output 取前景概率）
+
+            # 传入 roi_mask（B,1,D,H,W 或 None）
+            output_seg, output_cls = self.network(data, task_mode=None, roi_mask=roi_mask_for_cls)
+
+
+
 
             if mode == 'seg_only':
                 # 只训 seg：cls 分支在模型里已经 no_grad，这里 loss 置 0 就好
@@ -1341,33 +1400,24 @@ class nnUNetTrainer(object):
                 # 只训 cls：模型里已经保证 encoder/decoder 不反传梯度
                 self.lambda_seg, self.lambda_cls = 0.0, 1.0
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
-                l_cls = self.cls_loss(output_cls, target_cls)
+                logits = output_cls.clamp(min=-20.0, max=20.0).float()
+                with torch.autocast(device_type=self.device.type, enabled=False):
+                    l_cls = self.cls_loss(logits, target_cls)
                 l = l_cls
 
             else:  # mode == 'both'
-                # seg + cls 一起训，保持你之前的实现（早期多给一点 cls）
+                # seg + cls 一起训，（早期多给一点 cls）
 
-                self.lambda_seg = 1
-                self.lambda_cls = 0.03
+                t = min(1.0, max(0.0, self.current_epoch / max(1, self.roi_use_gt_epochs)))
+                self.lambda_seg = self.lambda_seg_both
+                self.lambda_cls = (1 - t) * self.lambda_cls_both_start + t * self.lambda_cls_both_end
 
                 # seg_loss 内部已经处理 deep supervision（DeepSupervisionWrapper）
                 l_seg = self.seg_loss(output_seg, target_seg)
 
-                # 先拿最高分辨率的 target，用于判断是否有肿瘤
-                if isinstance(target_seg, list):
-                    seg_hires = target_seg[0]     # (B, D, H, W)
-                else:
-                    seg_hires = target_seg        # (B, D, H, W)
-
-                # 简单假设：>0 就算 lesion
-                lesion_mask  = (seg_hires == 2)
-                has_lesion = lesion_mask.view(lesion_mask.shape[0], -1).any(dim=1)   # (B,) bool
-
-                if has_lesion.any():
-                    l_cls = self.cls_loss(output_cls[has_lesion], target_cls[has_lesion])
-                else:
-                    # 没有任何 lesion patch，就不给 cls 梯度
-                    l_cls = 0.0 * output_cls.sum()
+                logits = output_cls.clamp(min=-20.0, max=20.0).float()
+                with torch.autocast(device_type=self.device.type, enabled=False):
+                    l_cls = self.cls_loss(logits, target_cls)
 
                 l = self.lambda_seg * l_seg + self.lambda_cls * l_cls
 
@@ -1444,16 +1494,18 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output_seg, output_cls = self.network(data)
             del data
-
             if mode == 'cls_only':
-                # 只关心分类
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
-                l_cls = self.cls_loss(output_cls, target_cls)
+                logits_val = output_cls.clamp(min=-20.0, max=20.0).float()
+                with torch.autocast(device_type=self.device.type, enabled=False):
+                    l_cls = self.cls_loss(logits_val, target_cls)
                 l = l_cls
             else:
                 # seg_only 或 both
                 l_seg = self.seg_loss(output_seg, target_seg)
-                l_cls = self.cls_loss(output_cls, target_cls)
+                logits_val = output_cls.clamp(min=-20.0, max=20.0).float()
+                with torch.autocast(device_type=self.device.type, enabled=False):
+                    l_cls = self.cls_loss(logits_val, target_cls)
                 if mode == 'seg_only':
                     l = l_seg
                 else:  # both

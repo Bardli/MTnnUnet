@@ -75,31 +75,21 @@ class DualPathTransformerBlock(nn.Module):
         # === 强制用 float32，避免 AMP 下 multiheadattention 溢出 ===
         # ct_token = ct_token.float()
         # mem_tokens = mem_tokens.float()
-
+        orig_dtype = ct_token.dtype
         # ----- 路径1: ct <- mem -----
         ct_res = ct_token
         mem_res = mem_tokens
 
-        ct_norm = self.norm_ct1(ct_token)
-        mem_norm = self.norm_mem1(mem_tokens)
-        ct_updated, _ = self.attn_ct_from_mem(
-            query=ct_norm,
-            key=mem_norm,
-            value=mem_norm,
-            need_weights=False,
-        )
-        ct_token = ct_res + ct_updated
+        ct_norm = self.norm_ct1(ct_token).float()
+        mem_norm = self.norm_mem1(mem_tokens).float()
+        ct_updated, _ = self.attn_ct_from_mem(query=ct_norm, key=mem_norm, value=mem_norm, need_weights=False)
+        ct_token = ct_res + ct_updated.to(orig_dtype)
 
         # ----- 路径2: mem <- ct -----
-        ct_norm2 = self.norm_ct2(ct_token)
-        mem_norm2 = self.norm_mem2(mem_tokens)
-        mem_updated, _ = self.attn_mem_from_ct(
-            query=mem_norm2,
-            key=ct_norm2,
-            value=ct_norm2,
-            need_weights=False,
-        )
-        mem_tokens = mem_res + mem_updated
+        ct_norm2 = self.norm_ct2(ct_token).float()
+        mem_norm2 = self.norm_mem2(mem_tokens).float()
+        mem_updated, _ = self.attn_mem_from_ct(query=mem_norm2, key=ct_norm2, value=ct_norm2, need_weights=False)
+        mem_tokens = mem_res + mem_updated.to(orig_dtype)
 
         # ----- FFN + 残差 -----
         ct_ff = self.ff_ct(ct_token)
@@ -154,6 +144,7 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         cls_num_classes: int = 3,
         task_mode: str = 'seg_only',
         cls_dropout: float = 0.3,
+        lesion_channel_idx: int = 2
     ):
         super().__init__(
             input_channels=input_channels,
@@ -227,7 +218,7 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         self.task_mode = mode
 
     # ---- 主 forward：seg 路径保持 nnUNet 原样 ----
-    def forward(self, x, task_mode: str = None):
+    def forward(self, x, task_mode: str = None, roi_mask: torch.Tensor = None):
         mode = task_mode if task_mode is not None else self.task_mode
         assert mode in ('seg_only', 'both', 'cls_only')
 
@@ -247,63 +238,85 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         if mode == 'seg_only':
             with torch.no_grad():
                 # seg_output 已经在 no_grad 上下文中
-                cls_output = self._forward_cls_branch(skips, seg_output)
+                cls_output = self._forward_cls_branch(skips, seg_output, roi_mask)
         elif mode == 'cls_only':
                 # 冻结 encoder 和 decoder 的特征
             skips_detached = [s.detach() for s in skips]
-            # seg_output 已经在 no_grad 上下文中计算，自带 no_grad 属性
-            cls_output = self._forward_cls_branch(skips_detached, seg_output)
+            cls_output = self._forward_cls_branch(skips_detached, seg_output, roi_mask)
         else:  # both
             # 梯度流经 encoder, decoder, 和 cls_branch
-            cls_output = self._forward_cls_branch(skips, seg_output)
+            cls_output = self._forward_cls_branch(skips, seg_output, roi_mask)
 
         return seg_output, cls_output
 
     # ---- 分类分支：多尺度 pooling + Dual-path Transformer + 记忆原型 ----
-    def _forward_cls_branch(self, skips, seg_output):
-        # 1. 获取 seg_logits (必须转 float32
-        if isinstance(seg_output, (list, tuple)):
-            seg_logits = seg_output[0].float()
+    def _forward_cls_branch(self, skips, seg_output, roi_mask: torch.Tensor = None):
+        if roi_mask is not None:
+            lesion_mask_hires = roi_mask.float().detach()
+            if lesion_mask_hires.ndim == 4:
+                lesion_mask_hires = lesion_mask_hires.unsqueeze(1)
+            elif lesion_mask_hires.ndim != 5:
+                raise RuntimeError(f"roi_mask must be 4D or 5D, got {lesion_mask_hires.ndim}")
         else:
-            seg_logits = seg_output.float()
+            # ★ 预测阶段：用“非背景概率”作为 ROI（更稳定非空）
+            if isinstance(seg_output, (list, tuple)):
+                seg_logits = seg_output[0].float()
+            else:
+                seg_logits = seg_output.float()
+            probs = F.softmax(seg_logits, dim=1)              # B×C×DHW
+            # 前景 = 1 - 背景；或 sum_{c>=1} probs
+            foreground_mask = 1.0 - probs[:, 0:1, ...]
+            lesion_mask_hires = foreground_mask.detach()
+            # （可选）轻微膨胀
+            if getattr(self, 'cls_roi_dilate', False):
+                lesion_mask_hires = F.max_pool3d(lesion_mask_hires, kernel_size=3, stride=1, padding=1)
 
-        # 2. 生成掩码 (并 detach!)
-        probs = F.softmax(seg_logits, dim=1)
-        lesion_mask_hires = probs[:, 2:3, ...].detach() # 阶段 5 修复
+        device_type = skips[0].device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            # 逐样本安全的 masked pooling（附带 nan_to_num）
+            pooled_feats = []
+            B = skips[0].shape[0]
 
-        # 3. Masked Pooling (feat 不再 .float())
-        pooled_feats = []
-        for feat in skips:
-            # feat = feat.float()  <-- 已删除
-            current_shape = feat.shape[2:]
-            lesion_mask_resized = F.interpolate(lesion_mask_hires, 
-                                                size=current_shape, 
-                                                mode='trilinear', 
-                                                align_corners=False)
-            feat_masked = feat * lesion_mask_resized
-            feat_sum_per_channel = feat_masked.sum(dim=(2, 3, 4))
-            mask_sum_per_channel = lesion_mask_resized.sum(dim=(2, 3, 4)) + 1e-6
-            pooled = feat_sum_per_channel / mask_sum_per_channel
-            pooled_feats.append(pooled)
+            for feat in skips:
+                # feat: (B, C_i, D, H, W)
+                feat = torch.nan_to_num(feat.float(), nan=0.0, posinf=0.0, neginf=0.0)
 
-        # 4. 拼接 (不再 .float())
-        multi_scale_feat = torch.cat(pooled_feats, dim=1)
+                # 1) ROI resize 到当前尺度，确保是 (B, 1, D, H, W)
+                roi_resized = F.interpolate(
+                    torch.nan_to_num(lesion_mask_hires.float(), nan=0.0, posinf=0.0, neginf=0.0),
+                    size=feat.shape[2:], mode='trilinear', align_corners=False
+                )
 
-        ct_token = self.ct_proj(multi_scale_feat)
-        ct_token = ct_token.unsqueeze(1)
+                # 2) 逐样本面积 (B, 1)；做个下限，避免数值除零
+                area = roi_resized.sum(dim=(2, 3, 4)).clamp_min(1e-6)   # (B, 1)
 
-        B = ct_token.size(0)
-        # (不再 .float())
-        mem_tokens = self.prototype_memory.unsqueeze(0).expand(B, -1, -1) 
+                # 3) masked sum / area -> (B, C_i)
+                masked_sum = (feat * roi_resized).sum(dim=(2, 3, 4))    # (B, C_i)
+                masked_avg = masked_sum / area                       # 广播到 (B, C_i)
 
-        # 5. Dual block
-        ct_token, mem_tokens = self.dual_block(ct_token, mem_tokens)
+                # 4) GAP 备选，逐样本回退
+                gap_avg = feat.mean(dim=(2, 3, 4))                     # (B, C_i)
+                use_mask = (area > 1.0).float()                        # (B, 1) 阈值可调（>1 像素）
+                pooled = use_mask * masked_avg + (1.0 - use_mask) * gap_avg  # (B, C_i)
 
-        # 6. Output
-        ct_token = ct_token.squeeze(1)
-        cls_logits = self.cls_out(ct_token)
+                # 5) 强制二维，统一到 (B, C_i)
+                if pooled.dim() == 1:    # 万一丢了 batch 维
+                    pooled = pooled.unsqueeze(0)
+                pooled = pooled.view(B, -1)
 
-        # 7. 返回 float32 的 logits
-        return cls_logits.float()
+                pooled_feats.append(pooled)
+
+            # 6) 这里每个 pooled 都是 (B, C_i)，可以安全拼接
+            multi_scale_feat = torch.cat(pooled_feats, dim=1)  # (B, sum(C_i))
+
+            ct_token = self.ct_proj(multi_scale_feat).unsqueeze(1)        # (B,1,D) FP32
+            mem_tokens = self.prototype_memory.unsqueeze(0).expand(ct_token.size(0), -1, -1).float()
+
+            # Dual-path Transformer：你的 block 里 MHA 前已 .float()，这里继续保持 FP32
+            ct_token, mem_tokens = self.dual_block(ct_token, mem_tokens)
+
+            cls_logits = self.cls_out(ct_token.squeeze(1))                # (B,K) FP32
+
+        return cls_logits.float()  # 返回 FP32（或再 cast 回 half 均可）
 
 
