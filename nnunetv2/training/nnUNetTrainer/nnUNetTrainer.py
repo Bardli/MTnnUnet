@@ -244,7 +244,7 @@ class nnUNetTrainer(object):
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
                 self.network = torch.compile(self.network)
-
+            self.log_vars = torch.nn.Parameter(torch.zeros(2, device=self.device))  # seg & cls loss log var
             self.optimizer, self.lr_scheduler = self.configure_optimizers()
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
@@ -471,9 +471,13 @@ class nnUNetTrainer(object):
                                    use_ignore_label=self.label_manager.ignore_label is not None,
                                    dice_class=MemoryEfficientSoftDiceLoss)
         else:
+            # If the dataset does not declare an explicit ignore label, we still need to
+            # ignore padded voxels (-1) produced by cropping. Use -1 as an implicit ignore
+            # for the loss to prevent invalid indexing in one-hot scatter.
+            effective_ignore = self.label_manager.ignore_label if self.label_manager.ignore_label is not None else -1
             loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
                                    'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
-                                  ignore_label=self.label_manager.ignore_label, dice_class=MemoryEfficientSoftDiceLoss)
+                                  ignore_label=effective_ignore, dice_class=MemoryEfficientSoftDiceLoss)
 
         if self._do_i_compile():
             loss.dc = torch.compile(loss.dc)
@@ -600,7 +604,7 @@ class nnUNetTrainer(object):
                     cls_params.append(p)
                 else:
                     dec_params.append(p)
-
+            enc_params.append(self.log_vars) # include log_vars in encoder params
             optimizer = torch.optim.AdamW(
                 [
                     {'params': enc_params, 'lr': 3e-4},
@@ -729,56 +733,20 @@ class nnUNetTrainer(object):
         if self.dataset_class is None:
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
+        # 1) 拿到数据集对象
         dataset_tr, dataset_val = self.get_tr_and_val_datasets()
 
-        # --- 根据 task_mode 选择 patch_size & deep supervision ---
+        # 2) 先根据 task_mode 准备 patch_size 与 transforms（注意顺序，先定义 transforms 再实例化 dataloader）
         if self.task_mode == 'cls_only':
             patch_size = self.cls_patch_size
             deep_supervision_scales = None
-            # ⭐️ 关键改动 (1/2): DA 和验证的 Transform
-            self.print_to_log_file("Using CLS_ONLY mode: Applying LIGHTWEIGHT data augmentation.")
-            (
-                rotation_for_DA,
-                do_dummy_2d_data_aug,
-                initial_patch_size, # cls 模式下这个没用，但要占位
-                mirror_axes,
-            ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
-            
-            # ⭐️ 关键改动 (2/2): 调用新的轻量级 DA
-            tr_transforms = self.get_cls_training_transforms( # 👈 调用新函数
-                patch_size,
-                rotation_for_DA,
-                deep_supervision_scales,
-                mirror_axes,
-                do_dummy_2d_data_aug,
-                use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
-                is_cascaded=self.is_cascaded,
-                foreground_labels=self.label_manager.foreground_labels,
-                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-                ignore_label=self.label_manager.ignore_label
-            )
-            val_transforms = self.get_validation_transforms( # 验证集 DA 保持不变 (几乎没增强)
-                deep_supervision_scales,
-                is_cascaded=self.is_cascaded,
-                foreground_labels=self.label_manager.foreground_labels,
-                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-                ignore_label=self.label_manager.ignore_label
-            )
-            # --------------------------------------------------
 
-        else: # seg_only / both
-            patch_size = self.configuration_manager.patch_size
-            deep_supervision_scales = self._get_deep_supervision_scales()
-            
-            self.print_to_log_file("Using SEG/BOTH mode: Applying HEAVY data augmentation.")
-            (
-                rotation_for_DA,
-                do_dummy_2d_data_aug,
-                initial_patch_size, # 👈 seg 模式用这个
-                mirror_axes,
-            ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
+            (rotation_for_DA,
+            do_dummy_2d_data_aug,
+            _initial_patch_size,   # cls_only 下不用，但占位
+            mirror_axes) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
 
-            tr_transforms = self.get_training_transforms( # 👈 调用原始的重度 DA
+            tr_transforms = self.get_cls_training_transforms(
                 patch_size,
                 rotation_for_DA,
                 deep_supervision_scales,
@@ -798,61 +766,90 @@ class nnUNetTrainer(object):
                 ignore_label=self.label_manager.ignore_label
             )
 
-        # --- 构造 dataloader (这部分你改的很好，保持不变) ---
-        if self.task_mode == 'cls_only':
+            # 3) 直接用标准 nnUNetDataLoader（无均衡、无 subset_keys）
             dl_tr = nnUNetDataLoader(
                 dataset_tr, self.batch_size,
-                patch_size,          # initial_patch_size (用 cls_patch_size)
-                patch_size,          # final_patch_size (用 cls_patch_size)
+                patch_size,            # initial_patch_size
+                patch_size,            # final_patch_size
                 self.label_manager,
-                task_mode= self.task_mode,
+                task_mode=self.task_mode,
                 oversample_foreground_percent=0.0,
                 sampling_probabilities=None,
                 pad_sides=None,
-                transforms=tr_transforms, # 👈 使用上面选择的 tr_transforms
-                probabilistic_oversampling=False
+                probabilistic_oversampling=False,
+                transforms=tr_transforms
             )
             dl_val = nnUNetDataLoader(
                 dataset_val, self.batch_size,
-                patch_size,
-                patch_size,
+                patch_size,            # initial_patch_size
+                patch_size,            # final_patch_size
                 self.label_manager,
-                task_mode= self.task_mode,
+                task_mode=self.task_mode,
                 oversample_foreground_percent=0.0,
                 sampling_probabilities=None,
                 pad_sides=None,
-                transforms=val_transforms, # 👈 使用上面选择的 val_transforms
-                probabilistic_oversampling=False
-            )
-        else:
-            dl_tr = nnUNetDataLoader(
-                dataset_tr, self.batch_size,
-                initial_patch_size,                      # 👈 seg 模式用 initial_patch_size
-                self.configuration_manager.patch_size,   # 👈 seg 模式用 config 的 patch_size
-                self.label_manager,
-                task_mode= self.task_mode,
-                oversample_foreground_percent=self.oversample_foreground_percent,
-                sampling_probabilities=None,
-                pad_sides=None,
-                transforms=tr_transforms, # 👈 使用上面选择的 tr_transforms
-                probabilistic_oversampling=self.probabilistic_oversampling
-            )
-            dl_val = nnUNetDataLoader(
-                dataset_val, self.batch_size,
-                self.configuration_manager.patch_size,
-                self.configuration_manager.patch_size,
-                self.label_manager,
-                task_mode= self.task_mode,
-                oversample_foreground_percent=self.oversample_foreground_percent,
-                sampling_probabilities=None,
-                pad_sides=None,
-                transforms=val_transforms, # 👈 使用上面选择的 val_transforms
-                probabilistic_oversampling=self.probabilistic_oversampling
+                probabilistic_oversampling=False,
+                transforms=val_transforms
             )
 
-        # --- 多线程 wrapper (保持不变) ---
+        else:
+            # seg_only / both
+            patch_size = self.configuration_manager.patch_size
+            deep_supervision_scales = self._get_deep_supervision_scales()
+
+            (rotation_for_DA,
+            do_dummy_2d_data_aug,
+            initial_patch_size,     # seg/both 下需要：用于 random crop 区间计算
+            mirror_axes) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
+
+            tr_transforms = self.get_training_transforms(
+                patch_size,
+                rotation_for_DA,
+                deep_supervision_scales,
+                mirror_axes,
+                do_dummy_2d_data_aug,
+                use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+                is_cascaded=self.is_cascaded,
+                foreground_labels=self.label_manager.foreground_labels,
+                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+                ignore_label=self.label_manager.ignore_label
+            )
+            val_transforms = self.get_validation_transforms(
+                deep_supervision_scales,
+                is_cascaded=self.is_cascaded,
+                foreground_labels=self.label_manager.foreground_labels,
+                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+                ignore_label=self.label_manager.ignore_label
+            )
+
+            # 3) 直接用标准 nnUNetDataLoader（无均衡、无 subset_keys）
+            dl_tr = nnUNetDataLoader(
+                dataset_tr, self.batch_size,
+                initial_patch_size,            # 👈 训练时随机裁剪的“起始尺寸”
+                patch_size,                    # 👈 网络输入的最终尺寸（plans里的 patch_size）
+                self.label_manager,
+                task_mode=self.task_mode,
+                oversample_foreground_percent=self.oversample_foreground_percent,
+                sampling_probabilities=None,
+                pad_sides=None,
+                probabilistic_oversampling=self.probabilistic_oversampling,
+                transforms=tr_transforms
+            )
+            dl_val = nnUNetDataLoader(
+                dataset_val, self.batch_size,
+                patch_size,                    # 验证通常不做 random crop
+                patch_size,
+                self.label_manager,
+                task_mode=self.task_mode,
+                oversample_foreground_percent=self.oversample_foreground_percent,
+                sampling_probabilities=None,
+                pad_sides=None,
+                probabilistic_oversampling=self.probabilistic_oversampling,
+                transforms=val_transforms
+            )
+
+        # 4) 多线程封装（保持与原先一致）
         allowed_num_processes = get_allowed_n_proc_DA()
-        # ... (这部分代码保持你原来的不变) ...
         if allowed_num_processes == 0:
             mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
             mt_gen_val = SingleThreadedAugmenter(dl_val, None)
@@ -871,9 +868,13 @@ class nnUNetTrainer(object):
                 wait_time=0.002
             )
 
+        # 5) 预热一次，保持与原逻辑一致
         _ = next(mt_gen_train)
         _ = next(mt_gen_val)
         return mt_gen_train, mt_gen_val
+
+
+
 
 
     @staticmethod
@@ -1392,6 +1393,7 @@ class nnUNetTrainer(object):
             if mode == 'seg_only':
                 # 只训 seg：cls 分支在模型里已经 no_grad，这里 loss 置 0 就好
                 self.lambda_seg, self.lambda_cls = 1.0, 0.0
+                # removed debug stats
                 l_seg = self.seg_loss(output_seg, target_seg)
                 l_cls = torch.zeros(1, device=self.device, dtype=l_seg.dtype)
                 l = l_seg
@@ -1400,7 +1402,7 @@ class nnUNetTrainer(object):
                 # 只训 cls：模型里已经保证 encoder/decoder 不反传梯度
                 self.lambda_seg, self.lambda_cls = 0.0, 1.0
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
-                logits = output_cls.clamp(min=-20.0, max=20.0).float()
+                logits = output_cls.float()
                 with torch.autocast(device_type=self.device.type, enabled=False):
                     l_cls = self.cls_loss(logits, target_cls)
                 l = l_cls
@@ -1413,13 +1415,14 @@ class nnUNetTrainer(object):
                 self.lambda_cls = (1 - t) * self.lambda_cls_both_start + t * self.lambda_cls_both_end
 
                 # seg_loss 内部已经处理 deep supervision（DeepSupervisionWrapper）
+                # removed debug stats
                 l_seg = self.seg_loss(output_seg, target_seg)
 
-                logits = output_cls.clamp(min=-20.0, max=20.0).float()
+                logits = output_cls.float()
                 with torch.autocast(device_type=self.device.type, enabled=False):
                     l_cls = self.cls_loss(logits, target_cls)
 
-                l = self.lambda_seg * l_seg + self.lambda_cls * l_cls
+                l = torch.exp(-self.log_vars[0]) * l_seg + torch.exp(-self.log_vars[1]) * l_cls + (self.log_vars[0] + self.log_vars[1])
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1496,14 +1499,15 @@ class nnUNetTrainer(object):
             del data
             if mode == 'cls_only':
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
-                logits_val = output_cls.clamp(min=-20.0, max=20.0).float()
+                logits_val = output_cls.float()
                 with torch.autocast(device_type=self.device.type, enabled=False):
                     l_cls = self.cls_loss(logits_val, target_cls)
                 l = l_cls
             else:
                 # seg_only 或 both
+                # removed debug stats
                 l_seg = self.seg_loss(output_seg, target_seg)
-                logits_val = output_cls.clamp(min=-20.0, max=20.0).float()
+                logits_val = output_cls.float()
                 with torch.autocast(device_type=self.device.type, enabled=False):
                     l_cls = self.cls_loss(logits_val, target_cls)
                 if mode == 'seg_only':
@@ -1532,14 +1536,15 @@ class nnUNetTrainer(object):
             axes = [0] + list(range(2, output_seg.ndim))
 
             if self.label_manager.has_regions:
-                predicted_segmentation_onehot = (torch.sigmoid(output_seg) > 0.5).long()
+                predicted_segmentation_onehot = (torch.sigmoid(output_seg) > 0.5).to(torch.float32)
             else:
-                output_seg_argmax = output_seg.argmax(1)[:, None]
-                predicted_segmentation_onehot = torch.zeros(
-                    output_seg.shape, device=output_seg.device, dtype=torch.float32
-                )
-                predicted_segmentation_onehot.scatter_(1, output_seg_argmax, 1)
-                del output_seg_argmax
+                # Safer one-hot via F.one_hot to avoid scatter index issues
+                C_here = int(output_seg.shape[1])
+                idx = output_seg.argmax(1)  # (B, D, H, W)
+                # removed debug stats
+                idx = idx.clamp_(0, max(C_here - 1, 0))
+                predicted_segmentation_onehot = torch.nn.functional.one_hot(idx, num_classes=C_here)  # (B, D, H, W, C)
+                predicted_segmentation_onehot = predicted_segmentation_onehot.movedim(-1, 1).to(torch.float32)
 
             if self.label_manager.has_ignore_label:
                 if not self.label_manager.has_regions:
@@ -1552,7 +1557,33 @@ class nnUNetTrainer(object):
                         mask = 1 - target_seg[:, -1:]
                     target_seg = target_seg[:, :-1]
             else:
+                # no explicit ignore label in dataset.json. However, padding during cropping may
+                # introduce negative labels (e.g., -1). Those must not be used for metrics.
+                # We therefore mask out all voxels < 0 and set them to background (0) so that
+                # scatter_/one-hot indexing cannot go out of bounds on GPU.
                 mask = None
+                if not self.label_manager.has_regions:
+                    try:
+                        neg = target_seg < 0
+                        if torch.any(neg):
+                            mask = (~neg).float()
+                            target_seg[neg] = 0
+                    except Exception:
+                        # be permissive; if comparison fails due to dtype, just skip
+                        mask = None
+            # 检测目标中的负值（如 -1），将其并入 mask 中，并把负值写回 0，防止后续 one-hot / 统计越界
+            neg = (target_seg < 0)
+            if neg.any():
+                # 将负值位置纳入屏蔽；与已有 mask 取交集
+                add_mask = (~neg).float()
+                mask = add_mask if (mask is None) else (mask * add_mask)
+                # 避免原张量被其他地方引用导致意外改动，先 clone 再写
+                target_seg = target_seg.clone()
+                target_seg[neg] = 0
+
+            # 统一为 float，便于 get_tp_fp_fn_tn 的 mask 乘法
+            if (mask is not None) and (mask.dtype != torch.float32):
+                mask = mask.float()
 
             tp, fp, fn, _ = get_tp_fp_fn_tn(
                 predicted_segmentation_onehot, target_seg, axes=axes, mask=mask
@@ -1566,15 +1597,56 @@ class nnUNetTrainer(object):
                 fp_hard = fp_hard[1:]
                 fn_hard = fn_hard[1:]
 
+        # === Whole-pancreas (label>0) union Dice ===
+        if mode == 'cls_only':
+            wp_tp = np.array([0.], dtype=np.float64)
+            wp_fp = np.array([0.], dtype=np.float64)
+            wp_fn = np.array([0.], dtype=np.float64)
+        else:
+            # 取用于度量的最高分辨率输出/目标
+            if self.enable_deep_supervision:
+                pred_logits_here = output_seg[0]
+                gt_here = target_seg[0]
+            else:
+                pred_logits_here = output_seg
+                gt_here = target_seg
+
+            if self.label_manager.has_regions:
+                pred_onehot_here = (torch.sigmoid(pred_logits_here) > 0.5)
+                pred_union = pred_onehot_here.any(dim=1, keepdim=True)
+                tgt_union = (gt_here > 0).any(dim=1, keepdim=True)
+            else:
+                # argmax->onehot 已在上面得到 predicted_segmentation_onehot
+                pred_union = (predicted_segmentation_onehot[:, 1:, ...].sum(1, keepdim=True) > 0)
+                tgt_union = (gt_here != 0)
+
+            if mask is not None:
+                mbool = mask.bool() if mask.dtype != torch.bool else mask
+                pred_union = pred_union & mbool
+                tgt_union = tgt_union & mbool
+
+            # Compute union TP/FP/FN directly using boolean ops to avoid one-hot scatter
+            pred_b = pred_union.bool()
+            tgt_b = tgt_union.bool()
+            axes_wp = [0] + list(range(2, pred_b.ndim))
+            tp_wp = (pred_b & tgt_b).sum(dim=axes_wp, keepdim=False).to(torch.float32)
+            fp_wp = (pred_b & (~tgt_b)).sum(dim=axes_wp, keepdim=False).to(torch.float32)
+            fn_wp = ((~pred_b) & tgt_b).sum(dim=axes_wp, keepdim=False).to(torch.float32)
+
+            # 汇总成标量（numpy）
+            wp_tp = tp_wp.detach().cpu().numpy().astype(np.float64).sum(0, keepdims=True)
+            wp_fp = fp_wp.detach().cpu().numpy().astype(np.float64).sum(0, keepdims=True)
+            wp_fn = fn_wp.detach().cpu().numpy().astype(np.float64).sum(0, keepdims=True)
+
+        # 在返回值里追加：
         return {
             'loss': l.detach().cpu().numpy(),
             'loss_seg': l_seg.detach().cpu().numpy(),
             'loss_cls': l_cls.detach().cpu().numpy(),
-            'tp_hard': tp_hard,
-            'fp_hard': fp_hard,
-            'fn_hard': fn_hard,
+            'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard,
             'cls_pred': output_cls.detach().cpu().numpy(),
-            'cls_target': target_cls.detach().cpu().numpy()
+            'cls_target': target_cls.detach().cpu().numpy(),
+            'wp_tp': wp_tp, 'wp_fp': wp_fp, 'wp_fn': wp_fn,   # ★ NEW
         }
 
 
@@ -1651,6 +1723,34 @@ class nnUNetTrainer(object):
         macro_f1 = f1_score(cls_targets, cls_preds_int, average='macro', zero_division=0)
         # 计算 Accuracy
         accuracy = accuracy_score(cls_targets, cls_preds_int)
+        # --- Whole-pancreas union Dice 聚合 ---
+        wp_tp = np.sum(outputs_collated['wp_tp'], 0)
+        wp_fp = np.sum(outputs_collated['wp_fp'], 0)
+        wp_fn = np.sum(outputs_collated['wp_fn'], 0)
+
+        if self.is_ddp:
+            world_size = dist.get_world_size()
+            _tp = [None for _ in range(world_size)]
+            _fp = [None for _ in range(world_size)]
+            _fn = [None for _ in range(world_size)]
+            dist.all_gather_object(_tp, wp_tp)
+            dist.all_gather_object(_fp, wp_fp)
+            dist.all_gather_object(_fn, wp_fn)
+            wp_tp = np.vstack(_tp).sum(0)
+            wp_fp = np.vstack(_fp).sum(0)
+            wp_fn = np.vstack(_fn).sum(0)
+
+        den_wp = 2 * wp_tp + wp_fp + wp_fn
+        wp_dice = float(2 * wp_tp / np.maximum(den_wp, 1e-8)) if den_wp.sum() > 0 else 0.0
+        self.logger.log('val_dice_whole_pancreas', wp_dice, self.current_epoch)
+        # also track raw counts per epoch for debugging/analysis
+        try:
+            self.logger.log('val_wp_tp', float(np.array(wp_tp).sum()), self.current_epoch)
+            self.logger.log('val_wp_fp', float(np.array(wp_fp).sum()), self.current_epoch)
+            self.logger.log('val_wp_fn', float(np.array(wp_fn).sum()), self.current_epoch)
+        except Exception:
+            # be lenient if shapes are unexpected
+            pass
 
         # --- 6. GAI: 记录所有指标 ---
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
@@ -1696,8 +1796,10 @@ class nnUNetTrainer(object):
         dice_scores = self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]
         self.print_to_log_file('Pseudo dice (per class)', [np.round(i, decimals=4) for i in dice_scores])
         
-        # 假设 Label 1 = 胰腺, Label 2 = 病灶 (基于 nnU-Net 标签从 1 开始)
-        # `dice_scores` 数组索引 0 对应 Label 1, 索引 1 对应 Label 2
+        if 'val_dice_whole_pancreas' in self.logger.my_fantastic_logging:
+            self.print_to_log_file('Whole-pancreas Dice', 
+                np.round(self.logger.my_fantastic_logging['val_dice_whole_pancreas'][-1], 4))
+
         
         # 计算 Whole Pancreas (Label 1 + Label 2)
         # 注意：这需要修改 validation_step 来计算合并标签的 TP/FP/FN。

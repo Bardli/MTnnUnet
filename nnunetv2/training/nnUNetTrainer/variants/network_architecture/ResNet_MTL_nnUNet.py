@@ -144,7 +144,8 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         cls_num_classes: int = 3,
         task_mode: str = 'seg_only',
         cls_dropout: float = 0.3,
-        lesion_channel_idx: int = 2
+        lesion_channel_idx: int = 2,
+        cls_topk: float = 0.1
     ):
         super().__init__(
             input_channels=input_channels,
@@ -188,7 +189,7 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         # 将多尺度特征投到较小维度 d_model，当成一个 ct token
         self.d_model = min(256, self.cls_feat_dim)  # 控制容量，避免 240 例过拟合太严重
         self.ct_proj = nn.Linear(self.cls_feat_dim, self.d_model)
-
+        self.cls_topk = cls_topk  # 例如 0.1 表示 ROI 体素的前 10%
         # 3 个类的记忆原型 token（3 分类）
         # shape: [num_classes, d_model]
         self.prototype_memory = nn.Parameter(
@@ -258,65 +259,78 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
             elif lesion_mask_hires.ndim != 5:
                 raise RuntimeError(f"roi_mask must be 4D or 5D, got {lesion_mask_hires.ndim}")
         else:
-            # ★ 预测阶段：用“非背景概率”作为 ROI（更稳定非空）
-            if isinstance(seg_output, (list, tuple)):
-                seg_logits = seg_output[0].float()
-            else:
-                seg_logits = seg_output.float()
-            probs = F.softmax(seg_logits, dim=1)              # B×C×DHW
-            # 前景 = 1 - 背景；或 sum_{c>=1} probs
-            foreground_mask = 1.0 - probs[:, 0:1, ...]
-            lesion_mask_hires = foreground_mask.detach()
-            # （可选）轻微膨胀
+            seg_logits = (seg_output[0] if isinstance(seg_output, (list, tuple)) else seg_output).float()
+            probs = F.softmax(seg_logits, dim=1)
+            lesion_mask_hires = (1.0 - probs[:, 0:1, ...]).detach()
             if getattr(self, 'cls_roi_dilate', False):
                 lesion_mask_hires = F.max_pool3d(lesion_mask_hires, kernel_size=3, stride=1, padding=1)
 
         device_type = skips[0].device.type
         with torch.autocast(device_type=device_type, enabled=False):
-            # 逐样本安全的 masked pooling（附带 nan_to_num）
             pooled_feats = []
             B = skips[0].shape[0]
 
-            for feat in skips:
-                # feat: (B, C_i, D, H, W)
-                feat = torch.nan_to_num(feat.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            use_topk = getattr(self, 'use_topk_pool', True)
+            topk_ratio = getattr(self, 'topk_ratio', 0.1)
 
-                # 1) ROI resize 到当前尺度，确保是 (B, 1, D, H, W)
+            for feat in skips:
+                feat = torch.nan_to_num(feat.float(), nan=0.0, posinf=0.0, neginf=0.0)
                 roi_resized = F.interpolate(
                     torch.nan_to_num(lesion_mask_hires.float(), nan=0.0, posinf=0.0, neginf=0.0),
                     size=feat.shape[2:], mode='trilinear', align_corners=False
                 )
 
-                # 2) 逐样本面积 (B, 1)；做个下限，避免数值除零
-                area = roi_resized.sum(dim=(2, 3, 4)).clamp_min(1e-6)   # (B, 1)
+                # ROI 面积；阈值=16像素（过小则认为不可靠）
+                area = roi_resized.sum(dim=(2, 3, 4))
+                valid = (area > 16).squeeze(1)
 
-                # 3) masked sum / area -> (B, C_i)
-                masked_sum = (feat * roi_resized).sum(dim=(2, 3, 4))    # (B, C_i)
-                masked_avg = masked_sum / area                       # 广播到 (B, C_i)
-
-                # 4) GAP 备选，逐样本回退
-                gap_avg = feat.mean(dim=(2, 3, 4))                     # (B, C_i)
-                use_mask = (area > 1.0).float()                        # (B, 1) 阈值可调（>1 像素）
-                pooled = use_mask * masked_avg + (1.0 - use_mask) * gap_avg  # (B, C_i)
-
-                # 5) 强制二维，统一到 (B, C_i)
-                if pooled.dim() == 1:    # 万一丢了 batch 维
-                    pooled = pooled.unsqueeze(0)
-                pooled = pooled.view(B, -1)
+                if use_topk and valid.any():
+                    # 只在有效样本上做 top‑k，其他回退 GAP
+                    tk_all = self.topk_pool(feat, roi_resized, k=topk_ratio)  # [B,C]
+                    gap_all = feat.mean(dim=(2, 3, 4))                        # [B,C]
+                    pooled = torch.where(valid.view(B, 1), tk_all, gap_all)
+                else:
+                    pooled = feat.mean(dim=(2, 3, 4))
 
                 pooled_feats.append(pooled)
 
-            # 6) 这里每个 pooled 都是 (B, C_i)，可以安全拼接
             multi_scale_feat = torch.cat(pooled_feats, dim=1)  # (B, sum(C_i))
-
-            ct_token = self.ct_proj(multi_scale_feat).unsqueeze(1)        # (B,1,D) FP32
+            ct_token = self.ct_proj(multi_scale_feat).unsqueeze(1)       # (B,1,D)
             mem_tokens = self.prototype_memory.unsqueeze(0).expand(ct_token.size(0), -1, -1).float()
 
-            # Dual-path Transformer：你的 block 里 MHA 前已 .float()，这里继续保持 FP32
             ct_token, mem_tokens = self.dual_block(ct_token, mem_tokens)
+            cls_logits = self.cls_out(ct_token.squeeze(1))
 
-            cls_logits = self.cls_out(ct_token.squeeze(1))                # (B,K) FP32
+        return cls_logits.float()
 
-        return cls_logits.float()  # 返回 FP32（或再 cast 回 half 均可）
 
+    @staticmethod
+    def topk_pool(feats: torch.Tensor, mask: torch.Tensor, k: float = 0.1) -> torch.Tensor:
+        """
+        feats: [B,C,D,H,W]；mask: [B,1,D,H,W]，元素∈[0,1]
+        k∈(0,1] 表示取 ROI 体素数的 k 比例；k>=1 表示固定取前 k 个。
+        注意：若 mask 全 0，返回 0 向量（调用处要自行 fallback 到 GAP）
+        """
+        assert feats.shape[0] == mask.shape[0] and feats.ndim == mask.ndim
+        x = feats * mask                  # 屏蔽 ROI 外
+        B, C = x.shape[:2]
+        x = x.view(B, C, -1)              # (B,C,N)
+        m = mask.view(B, 1, -1)           # (B,1,N)
+
+        # 计算每个样本的 k
+        if isinstance(k, float) and k <= 1.0:
+            k_each = torch.clamp((m.sum(-1) * k).long(), min=1)  # (B,1)
+        else:
+            k_each = torch.full((B, 1), int(k), dtype=torch.long, device=x.device)
+
+        kmax = int(k_each.max().item())
+        if kmax <= 0 or x.shape[-1] == 0:
+            return torch.zeros(B, C, device=x.device, dtype=x.dtype)
+
+        vals, _ = torch.topk(x, k=kmax, dim=-1)  # (B,C,kmax)
+        out = []
+        for b in range(B):
+            kb = int(k_each[b].item())
+            out.append(vals[b, :, :kb].mean(-1))
+        return torch.stack(out, 0)  # (B,C)
 

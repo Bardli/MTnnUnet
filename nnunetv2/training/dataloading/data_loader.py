@@ -29,7 +29,9 @@ class nnUNetDataLoader(DataLoader):
                  pad_sides: Union[List[int], Tuple[int, ...]] = None,
                  probabilistic_oversampling: bool = False,
                  transforms=None,
-                 cls_patch_size: Union[List[int], Tuple[int, ...], np.ndarray, None] = None
+                 cls_patch_size: Union[List[int], Tuple[int, ...], np.ndarray, None] = None,
+                 subset_keys: Union[List[str], Tuple[str, ...], None] = None,
+                 exact_keys: bool = False
                  ):
         """
         If we get a 2D patch size, make it pseudo 3D and remember to remove the singleton dimension before
@@ -43,6 +45,8 @@ class nnUNetDataLoader(DataLoader):
             f"task_mode must be 'seg_only', 'cls_only' or 'both', got {task_mode}"
         self.task_mode = task_mode
 
+
+
         # 2D → 3D 伪 3D 处理
         if len(patch_size) == 2:
             final_patch_size = (1, *patch_size)
@@ -51,8 +55,23 @@ class nnUNetDataLoader(DataLoader):
         else:
             self.patch_size_was_2d = False
 
+        self._subset_keys = list(subset_keys) if subset_keys is not None else None
+        self._exact_keys = bool(exact_keys)
+        if self._subset_keys is not None:
+            self.indices = list(self._subset_keys)
+
         # 这个 indices 是 DataLoader 抽样 case 用的
-        self.indices = data.identifiers
+        if subset_keys is not None:
+            # 校验 key 都在数据集中
+            id_set = set(data.identifiers)
+            bad = [k for k in subset_keys if k not in id_set]
+            if len(bad):
+                raise ValueError(f"subset_keys 中存在未知病例: {bad[:3]} ...")
+            self.indices = list(subset_keys)
+            self._subset_mode = True
+        else:
+            self.indices = data.identifiers
+            self._subset_mode = False
 
         self.oversample_foreground_percent = oversample_foreground_percent
         self.final_patch_size = final_patch_size
@@ -183,13 +202,17 @@ class nnUNetDataLoader(DataLoader):
                 # 解析分类标签 quiz_LABEL_xxx
                 try:
                     class_label = int(i.split('_')[1])
-                    class_labels_all[j] = class_label
                 except (IndexError, ValueError):
                     raise RuntimeError(
-                        f"Failed to parse class label from case identifier: '{i}'. "
+                        f"[DataLoader] Failed to parse class label from identifier '{i}'. "
                         f"Expected format 'quiz_LABEL_CASEID'."
                     )
-
+                if class_label < 0 or class_label > 2:
+                    raise RuntimeError(
+                        f"[DataLoader] Out-of-range class label {class_label} for '{i}'. "
+                        f"Expected one of {{0,1,2}}."
+                    )
+                class_labels_all[j] = class_label
                 data, seg, seg_prev, properties = self._data.load_case(i)
                 img_shape = np.array(data.shape[1:])      # (D,H,W)
                 patch = self.cls_patch_size               # (pD,pH,pW)
@@ -244,9 +267,17 @@ class nnUNetDataLoader(DataLoader):
             # 解析分类标签 quiz_LABEL_xxx
             try:
                 class_label = int(i.split('_')[1])
-                class_labels_all[j] = class_label
             except (IndexError, ValueError):
-                class_labels_all[j] = -1   # 出错就标 -1（最好数据里保证格式正确）
+                raise RuntimeError(
+                    f"[DataLoader] Failed to parse class label from identifier '{i}'. "
+                    f"Expected format 'quiz_LABEL_CASEID'."
+                )
+            if class_label < 0 or class_label > 2:
+                raise RuntimeError(
+                    f"[DataLoader] Out-of-range class label {class_label} for '{i}'. "
+                    f"Expected one of {{0,1,2}}."
+                )
+            class_labels_all[j] = class_label
 
             force_fg = self.get_do_oversample(j)
             data, seg, seg_prev, properties = self._data.load_case(i)
@@ -296,6 +327,12 @@ class nnUNetDataLoader(DataLoader):
             'class_label': class_labels_all,
             'keys': selected_keys
         }
+    def get_indices(self) -> List[str]:
+        # 若外部传入了一次性 keys，并要求精确使用，就直接返回这批 keys
+        if self._subset_keys is not None and self._exact_keys and len(self._subset_keys) == self.batch_size:
+            return list(self._subset_keys)
+        # 否则走父类随机逻辑
+        return super().get_indices()
 
 
 if __name__ == '__main__':
