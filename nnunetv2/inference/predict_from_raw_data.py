@@ -90,8 +90,9 @@ class nnUNetPredictor(object):
                 configuration_name = checkpoint['init_args']['configuration']
                 inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
                     'inference_allowed_mirroring_axes' in checkpoint.keys() else None
-
-            parameters.append(checkpoint['network_weights'])
+            # 优先使用 EMA 权重（若可用）
+            net_state = checkpoint.get('ema_network_weights', checkpoint['network_weights'])
+            parameters.append(net_state)
 
         configuration_manager = plans_manager.get_configuration(configuration_name)
         # restore network
@@ -677,8 +678,9 @@ class nnUNetPredictor(object):
                                                        ):
         predicted_logits = n_predictions = prediction = gaussian = workon = None
         results_device = self.device if do_on_device else torch.device('cpu')
-        # --- GAI: 为分类结果添加一个累加器 ---
+        # --- GAI: 为分类结果添加一个累加器与权重 ---
         all_cls_predictions = []
+        cls_weights = []
         def producer(d, slh, q):
             for s in slh:
                 q.put((torch.clone(d[s][None], memory_format=torch.contiguous_format).to(self.device), s))
@@ -726,6 +728,16 @@ class nnUNetPredictor(object):
                     
                     # 累加分类预测
                     all_cls_predictions.append(prediction_cls.to(results_device))
+                    # 计算该 patch 的前景权重（用于 cls 聚合加权）：使用非背景概率的均值
+                    try:
+                        seg_logits_patch = prediction_seg  # [1, C, D, H, W]
+                        probs_patch = torch.softmax(seg_logits_patch, dim=1)
+                        # 非背景概率（1 - 背景通道）
+                        fg_prob = 1.0 - probs_patch[:, 0:1]
+                        w = float(fg_prob.mean().detach().cpu().item())
+                    except Exception:
+                        w = 1.0
+                    cls_weights.append(max(w, 1e-6))
                     # --- GAI 结束 ---
 
                     if self.use_gaussian:
@@ -745,12 +757,13 @@ class nnUNetPredictor(object):
                 raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
                                    'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
                                    'predicted_logits to fp32')
-            # --- GAI: 聚合分类结果 ---
+            # --- GAI: 聚合分类结果（前景占比加权平均） ---
             # 堆叠所有补丁的预测 [Num_Patches, 1 (Batch_Size), Num_Classes]
             if all_cls_predictions:
                 aggregated_cls_preds = torch.stack(all_cls_predictions)
-                # 在所有补丁上取平均值 (dim=0)
-                final_cls_pred = torch.mean(aggregated_cls_preds, dim=0)
+                w = torch.tensor(cls_weights, device=results_device, dtype=aggregated_cls_preds.dtype)
+                w = w / (w.sum() + 1e-8)
+                final_cls_pred = (aggregated_cls_preds * w.view(-1, 1, 1)).sum(dim=0)
             else:
                 # 理论上不应该发生，但作为回退
                 final_cls_pred = torch.empty((0, 0), device=results_device) 

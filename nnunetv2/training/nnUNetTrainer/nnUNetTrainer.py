@@ -156,11 +156,11 @@ class nnUNetTrainer(object):
         ### Some hyperparameters for you to fiddle with
         self.initial_lr = 1e-2
         self.weight_decay = 3e-5
-        self.oversample_foreground_percent = 0.33
+        self.oversample_foreground_percent = 0.5
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250 
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 200
+        self.num_epochs = 1000
         self.current_epoch = 0
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
@@ -171,9 +171,21 @@ class nnUNetTrainer(object):
         # ===== BOTH 模式下分类 ROI 课程 & 损失权重（新增默认值） =====
         self.roi_use_gt_epochs     = 60   # 前60个epoch用GT ROI，之后用预测ROI
         self.lesion_label_value    = 2    # target_seg里“病灶”标签的整数值（你的数据是0/1/2→病灶=2）
-        self.lambda_seg_both       = 1.0  # BOTH模式分割损失权重
-        self.lambda_cls_both_start = 0.5  # 分类权重从0.5线性升到1.0（随epoch）
-        self.lambda_cls_both_end   = 1.0
+        # self.lambda_seg_both       = 1.0  # BOTH模式分割损失权重
+        # self.lambda_cls_both_start = 0.5  # 分类权重从0.5线性升到1.0（随epoch）
+        # self.lambda_cls_both_end   = 1.0
+
+        # 分类平滑（用于 CrossEntropyLoss）
+        self.cls_label_smoothing = 0.05
+
+        # EMA 设置
+        self.ema_decay = 0.999
+        self.ema_model = None  # 训练时维护一份 EMA 模型，用于验证/保存
+
+        # 任务权重：Softmax 约束（替代 log-variance 加权）
+        # 初始化时略偏向分割（分类较弱），避免早期不稳定
+        self.task_logits = torch.nn.Parameter(torch.tensor([0.0, -0.5], device=self.device))
+        self.task_entropy_reg = 0.0  # 可选：>0 防止塌缩，例如 0.01
 
 
 
@@ -244,7 +256,6 @@ class nnUNetTrainer(object):
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
                 self.network = torch.compile(self.network)
-            self.log_vars = torch.nn.Parameter(torch.zeros(2, device=self.device))  # seg & cls loss log var
             self.optimizer, self.lr_scheduler = self.configure_optimizers()
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
@@ -252,8 +263,8 @@ class nnUNetTrainer(object):
                 self.network = DDP(self.network, device_ids=[self.local_rank])
 
             self.seg_loss = self._build_loss()
-            # new classification loss
-            self.cls_loss = torch.nn.CrossEntropyLoss() # 或者 BCEWithLogitsLoss 等
+            # new classification loss (with label smoothing)
+            self.cls_loss = torch.nn.CrossEntropyLoss(label_smoothing=self.cls_label_smoothing)
 
 
 
@@ -277,6 +288,32 @@ class nnUNetTrainer(object):
         else:
             raise RuntimeError("You have called self.initialize even though the trainer was already initialized. "
                                "That should not happen.")
+
+    def _get_model_for_ema(self):
+        mod = self.network.module if self.is_ddp else self.network
+        if isinstance(mod, OptimizedModule):
+            mod = mod._orig_mod
+        return mod
+
+    def _init_ema(self):
+        if self.ema_model is None:
+            src = self._get_model_for_ema()
+            self.ema_model = deepcopy(src).to(self.device)
+            for p in self.ema_model.parameters():
+                p.requires_grad = False
+            self.ema_model.eval()
+
+    def _update_ema(self):
+        if self.ema_model is None:
+            self._init_ema()
+        d = self.ema_decay
+        src = self._get_model_for_ema()
+        with torch.no_grad():
+            for ema_p, p in zip(self.ema_model.parameters(), src.parameters()):
+                ema_p.data.mul_(d).add_(p.data, alpha=(1. - d))
+            # 同步 buffers（如 BN 统计量）
+            for ema_b, b in zip(self.ema_model.buffers(), src.buffers()):
+                ema_b.mul_(d).add_(b, alpha=(1. - d))
 
     def _do_i_compile(self):
         # new default: compile is enabled!
@@ -604,12 +641,12 @@ class nnUNetTrainer(object):
                     cls_params.append(p)
                 else:
                     dec_params.append(p)
-            enc_params.append(self.log_vars) # include log_vars in encoder params
             optimizer = torch.optim.AdamW(
                 [
                     {'params': enc_params, 'lr': 3e-4},
                     {'params': dec_params, 'lr': 3e-4},
                     {'params': cls_params, 'lr': 1e-3},   # 分类头更大一点
+                    {'params': [self.task_logits], 'lr': 1e-3, 'weight_decay': 0.0},  # 任务权重 logits，不做WD
                 ],
                 weight_decay=1e-4
     )
@@ -1243,8 +1280,9 @@ class nnUNetTrainer(object):
 
                     class_weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
 
-                    # 5. ★ 覆盖原有的 cls_loss，之后 train_step 统一用这个 ★
-                    self.cls_loss = torch.nn.CrossEntropyLoss(weight=class_weights)
+                    # 5. ★ 覆盖原有的 cls_loss，之后 train_step 统一用这个 ★（带 label smoothing）
+                    self.cls_loss = torch.nn.CrossEntropyLoss(weight=class_weights,
+                                                              label_smoothing=self.cls_label_smoothing)
 
                     self.print_to_log_file(f"Successfully applied weighted CrossEntropyLoss.")
                     self.print_to_log_file(f"Class counts (this fold): {counts}")
@@ -1408,21 +1446,15 @@ class nnUNetTrainer(object):
                 l = l_cls
 
             else:  # mode == 'both'
-                # seg + cls 一起训，（早期多给一点 cls）
-
-                t = min(1.0, max(0.0, self.current_epoch / max(1, self.roi_use_gt_epochs)))
-                self.lambda_seg = self.lambda_seg_both
-                self.lambda_cls = (1 - t) * self.lambda_cls_both_start + t * self.lambda_cls_both_end
-
-                # seg_loss 内部已经处理 deep supervision（DeepSupervisionWrapper）
-                # removed debug stats
+                # seg + cls 一起训：Softmax 约束权重
                 l_seg = self.seg_loss(output_seg, target_seg)
-
                 logits = output_cls.float()
                 with torch.autocast(device_type=self.device.type, enabled=False):
                     l_cls = self.cls_loss(logits, target_cls)
-
-                l = torch.exp(-self.log_vars[0]) * l_seg + torch.exp(-self.log_vars[1]) * l_cls + (self.log_vars[0] + self.log_vars[1])
+                w = torch.softmax(self.task_logits, dim=0)
+                l = w[0] * l_seg + w[1] * l_cls
+                if self.task_entropy_reg > 0:
+                    l = l + self.task_entropy_reg * (w * (w.clamp_min(1e-12).log())).sum()
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1430,10 +1462,14 @@ class nnUNetTrainer(object):
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
+            # EMA 更新
+            self._update_ema()
         else:
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
+            # EMA 更新
+            self._update_ema()
 
         return {
             'loss': l.detach().cpu().numpy(),         # 总损失（取决于 task_mode）
@@ -1475,6 +1511,8 @@ class nnUNetTrainer(object):
 
     def on_validation_epoch_start(self):
         self.network.eval()
+        if getattr(self, 'ema_model', None) is not None:
+            self.ema_model.eval()
 
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
@@ -1495,7 +1533,9 @@ class nnUNetTrainer(object):
 
         # ---- forward ----
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output_seg, output_cls = self.network(data)
+            # 使用 EMA 模型进行验证（若可用）
+            net = self.ema_model if getattr(self, 'ema_model', None) is not None else self.network
+            output_seg, output_cls = net(data)
             del data
             if mode == 'cls_only':
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
@@ -1513,7 +1553,11 @@ class nnUNetTrainer(object):
                 if mode == 'seg_only':
                     l = l_seg
                 else:  # both
-                    l = (self.lambda_seg * l_seg) + (self.lambda_cls * l_cls)
+                    # 统一与 train_step：Softmax 约束权重
+                    w = torch.softmax(self.task_logits, dim=0)
+                    l = w[0] * l_seg + w[1] * l_cls
+                    if self.task_entropy_reg > 0:
+                        l = l + self.task_entropy_reg * (w * (w.clamp_min(1e-12).log())).sum()
 
         # =========================
         # 分割指标：cls_only 直接跳过
@@ -1809,16 +1853,29 @@ class nnUNetTrainer(object):
             self.print_to_log_file(f'  -> Pancreas (Label 1) Dice: {np.round(dice_scores[0], decimals=4)}')
         if len(dice_scores) > 1:
             self.print_to_log_file(f'  -> Lesion (Label 2) Dice: {np.round(dice_scores[1], decimals=4)}')
+
+        # --- GAI: 打印分类指标（macro-average F1 与 accuracy） ---
+        if 'val_macro_f1' in self.logger.my_fantastic_logging and \
+           len(self.logger.my_fantastic_logging['val_macro_f1']) > 0:
+            self.print_to_log_file('Classification macro-average F1', 
+                                   np.round(self.logger.my_fantastic_logging['val_macro_f1'][-1], 4))
+        if 'val_accuracy' in self.logger.my_fantastic_logging and \
+           len(self.logger.my_fantastic_logging['val_accuracy']) > 0:
+            self.print_to_log_file('Classification accuracy', 
+                                   np.round(self.logger.my_fantastic_logging['val_accuracy'][-1], 4))
+
+        # 可选：打印 Whole‑pancreas 的 TP/FP/FN 计数（若已记录）
+        if 'val_wp_tp' in self.logger.my_fantastic_logging and len(self.logger.my_fantastic_logging['val_wp_tp']) > 0:
+            self.print_to_log_file('Whole-pancreas TP', self.logger.my_fantastic_logging['val_wp_tp'][-1])
+        if 'val_wp_fp' in self.logger.my_fantastic_logging and len(self.logger.my_fantastic_logging['val_wp_fp']) > 0:
+            self.print_to_log_file('Whole-pancreas FP', self.logger.my_fantastic_logging['val_wp_fp'][-1])
+        if 'val_wp_fn' in self.logger.my_fantastic_logging and len(self.logger.my_fantastic_logging['val_wp_fn']) > 0:
+            self.print_to_log_file('Whole-pancreas FN', self.logger.my_fantastic_logging['val_wp_fn'][-1])
         
         # 打印 Mean Foreground Dice
         self.print_to_log_file('Mean Foreground Dice', np.round(self.logger.my_fantastic_logging['mean_fg_dice'][-1], decimals=4))
 
-        # --- GAI: 打印分类指标 ---
-        # self.print_to_log_file('val_classification_targets', self.logger.my_fantastic_logging['val_classification_targets'][-1])
-        # self.print_to_log_file('val_classification_predictions', self.logger.my_fantastic_logging['val_classification_predictions'][-1])
-        self.print_to_log_file('val_accuracy', np.round(self.logger.my_fantastic_logging['val_accuracy'][-1], decimals=4))
-        self.print_to_log_file('val_macro_f1', np.round(self.logger.my_fantastic_logging['val_macro_f1'][-1], decimals=4))
-        # --- GAI END ---
+        # 分类详细输出已在上方打印（macro-F1 与 accuracy）
 
         self.print_to_log_file(
             f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
@@ -1862,6 +1919,12 @@ class nnUNetTrainer(object):
                     'trainer_name': self.__class__.__name__,
                     'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
                 }
+                # 若存在 EMA，附带保存（推理端将优先使用）
+                if getattr(self, 'ema_model', None) is not None:
+                    try:
+                        checkpoint['ema_network_weights'] = self.ema_model.state_dict()
+                    except Exception:
+                        pass
                 torch.save(checkpoint, filename)
             else:
                 self.print_to_log_file('No checkpoint written, checkpointing is disabled')
@@ -1904,9 +1967,29 @@ class nnUNetTrainer(object):
             if checkpoint['grad_scaler_state'] is not None:
                 self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
 
+        # 如果存在 EMA 权重，则尝试加载到本地 EMA 模型
+        if 'ema_network_weights' in checkpoint:
+            try:
+                self._init_ema()
+                self.ema_model.load_state_dict(checkpoint['ema_network_weights'])
+            except Exception:
+                pass
+
     def perform_actual_validation(self, save_probabilities: bool = False):
         self.set_deep_supervision_enabled(False)
         self.network.eval()
+        net_for_val = self.ema_model if getattr(self, 'ema_model', None) is not None else self.network
+        # 关闭 EMA 模型上的深监督
+        try:
+            mod = net_for_val.module if isinstance(net_for_val, DDP) else net_for_val
+            if isinstance(mod, OptimizedModule):
+                mod = mod._orig_mod
+            if hasattr(mod, 'decoder'):
+                mod.decoder.deep_supervision = False
+            if hasattr(mod, 'deep_supervision'):
+                mod.deep_supervision = False
+        except Exception:
+            pass
 
         if self.is_ddp and self.batch_size == 1 and self.enable_deep_supervision and self._do_i_compile():
             self.print_to_log_file("WARNING! batch size is 1 during training and torch.compile is enabled. If you "
@@ -1921,7 +2004,7 @@ class nnUNetTrainer(object):
         predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                         perform_everything_on_device=True, device=self.device, verbose=False,
                                         verbose_preprocessing=False, allow_tqdm=False)
-        predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
+        predictor.manual_initialization(net_for_val, self.plans_manager, self.configuration_manager, None,
                                         self.dataset_json, self.__class__.__name__,
                                         self.inference_allowed_mirroring_axes)
 
