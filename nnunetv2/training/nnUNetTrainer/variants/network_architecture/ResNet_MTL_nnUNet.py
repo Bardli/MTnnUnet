@@ -113,9 +113,9 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         - ct_token -> Linear 输出 3 类 logits
 
     task_mode:
-      - 'seg_only' : 只训 seg（cls 分支 no_grad）
-      - 'both'     : seg + cls 一起训
-      - 'cls_only' : 只训 cls（encoder/decoder no_grad）
+      - 'seg_only' : 只训 seg（cls 分支 no_grad，不更新）
+      - 'both'     : seg + voxel-level cls 一起训（推荐）
+      - 'cls_only' : 只训 cls（encoder/decoder no_grad，仅更新 cls head）
     """
     def __init__(
         self,
@@ -140,7 +140,7 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         block: Union[Type[BasicBlockD], Type[BottleneckD]] = BasicBlockD,
         bottleneck_channels: Union[int, List[int], Tuple[int, ...]] = None,
         stem_channels: int = None,
-        # --- 额外：分类相关 ---
+        # === 额外：分类相关 ===
         cls_num_classes: int = 3,
         task_mode: str = 'seg_only',
         cls_dropout: float = 0.3,
@@ -213,7 +213,7 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         init_last_bn_before_add_to_0(self)
         # 原型在上面已经手动 normal 初始化了，不会被 He 覆盖
 
-    # ---- 小工具：外部可以随时切模式 ----
+    # 方便外部切换模式
     def set_task_mode(self, mode: str):
         assert mode in ('seg_only', 'both', 'cls_only')
         self.task_mode = mode
@@ -225,12 +225,11 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
 
         # encoder + decoder
         if mode == 'cls_only':
-            # 只做分类：encoder/decoder 不要梯度
+            # 分类微调阶段：encoder/decoder 冻结
             with torch.no_grad():
                 skips = self.encoder(x)      # list of [B, C_i, D_i, H_i, W_i]
                 seg_output = self.decoder(skips)
         else:
-            # seg_only / both：正常训练 seg 分支
             skips = self.encoder(x)
             seg_output = self.decoder(skips)
 
@@ -248,7 +247,7 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
             # 梯度流经 encoder, decoder, 和 cls_branch
             cls_output = self._forward_cls_branch(skips, seg_output, roi_mask)
 
-        return seg_output, cls_output
+        return seg_output, cls_voxel_logits  # seg_output: list/tensor; cls_voxel_logits: [B, C_cls, D,H,W]
 
     # ---- 分类分支：多尺度 pooling + Dual-path Transformer + 记忆原型 ----
     def _forward_cls_branch(self, skips, seg_output, roi_mask: torch.Tensor = None):

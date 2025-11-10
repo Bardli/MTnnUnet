@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from batchgenerators.dataloading.data_loader import DataLoader
 from batchgenerators.utilities.file_and_folder_operations import join, load_json
-from threadpoolctl import threadpool_limits
+import threadpoolctl
 
 from nnunetv2.paths import nnUNet_preprocessed
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetBaseDataset
@@ -191,15 +191,23 @@ class nnUNetDataLoader(DataLoader):
     def generate_train_batch(self):
         selected_keys = self.get_indices()
 
+    def generate_train_batch(self):
+        selected_keys = self.get_indices()
+
         # =========================
-        # CLS_ONLY 模式：固定 cls_patch_size，中心对齐 + pad，不随机 crop
+        # CLS_ONLY 模式：
+        #   - 生成 [B, C, *cls_patch_size] 的 data
+        #   - 生成 [B, C, *cls_patch_size] 的 class_label
+        #       背景 + pancreas = 0
+        #       lesion 区域 = subtype (0/1/2)
         # =========================
         if self.task_mode == 'cls_only':
-            data_all = np.zeros(self.data_shape, dtype=np.float32)
-            class_labels_all = np.zeros(self.batch_size, dtype=np.int64)
+            data_all = np.zeros(self.data_shape, dtype=np.float32)   # [B, C, D, H, W]
+            num_color_channels = self.data_shape[1]
+            cls_all = np.zeros_like(data_all, dtype=np.int16)        # [B, C, D, H, W]
 
             for j, i in enumerate(selected_keys):
-                # 解析分类标签 quiz_LABEL_xxx
+                # -------- 1) 解析 subtype，假设 case id 形如 quiz_0_xxx / quiz_1_xxx / quiz_2_xxx --------
                 try:
                     class_label = int(i.split('_')[1])
                 except (IndexError, ValueError):
@@ -214,47 +222,95 @@ class nnUNetDataLoader(DataLoader):
                     )
                 class_labels_all[j] = class_label
                 data, seg, seg_prev, properties = self._data.load_case(i)
+                # data: [C, D, H, W]
+                # seg:  [1, D, H, W] (0=bg, 1=pancreas, 2=lesion 假设)
+
                 img_shape = np.array(data.shape[1:])      # (D,H,W)
                 patch = self.cls_patch_size               # (pD,pH,pW)
 
-                # 中心对齐的 bbox（可能越界 → crop_and_pad_nd 自动 pad）
-                bbox_lbs = []
-                bbox_ubs = []
-                for d in range(len(img_shape)):
-                    lb = (img_shape[d] - patch[d]) // 2   # 可能是负数
-                    ub = lb + patch[d]
-                    bbox_lbs.append(int(lb))
-                    bbox_ubs.append(int(ub))
-                bbox = [[lb, ub] for lb, ub in zip(bbox_lbs, bbox_ubs)]
+                seg_fg = seg[0]                           # [D,H,W]
 
+                # -------- 3) 定义 lesion 区域（根据 seg 的 lesion 标号改这里）--------
+                # 如果你的病灶 label 不是 2，请改成 seg_fg == 你的病灶 label
+                lesion_mask = (seg_fg == 2)
+
+                # -------- 4) 计算裁剪 bbox：优先围绕 lesion 中心，否则退回到整图中心 --------
+                if lesion_mask.any():
+                    coords = np.where(lesion_mask)
+                    z_min, z_max = coords[0].min(), coords[0].max()
+                    y_min, y_max = coords[1].min(), coords[1].max()
+                    x_min, x_max = coords[2].min(), coords[2].max()
+
+                    cz = 0.5 * (z_min + z_max)
+                    cy = 0.5 * (y_min + y_max)
+                    cx = 0.5 * (x_min + x_max)
+
+                    bbox_lbs = []
+                    bbox_ubs = []
+                    for d, c in enumerate([cz, cy, cx]):
+                        lb = int(round(c - patch[d] / 2.0))
+                        ub = lb + patch[d]
+                        bbox_lbs.append(lb)
+                        bbox_ubs.append(ub)
+                else:
+                    # 没有 lesion：退回整图中心裁剪
+                    bbox_lbs = []
+                    bbox_ubs = []
+                    for d in range(len(img_shape)):
+                        lb = (img_shape[d] - patch[d]) // 2
+                        ub = lb + patch[d]
+                        bbox_lbs.append(int(lb))
+                        bbox_ubs.append(int(ub))
+
+                bbox = [[lb, ub] for lb, ub in zip(bbox_lbs, bbox_ubs)]  # [[z_lb,z_ub], [y_lb,y_ub], [x_lb,x_ub]]
+
+                # -------- 5) 构造 3D 体素级 subtype 标签 --------
+                #   背景 + pancreas → 0
+                #   lesion 区域 → subtype (0/1/2)
+                cls_vol = np.zeros_like(seg_fg, dtype=np.int16)  # [D,H,W]
+                cls_vol[lesion_mask] = subtype
+
+                # 复制成 C 通道，方便和 image 一起做几何变换
+                cls_vol_c = np.repeat(cls_vol[None, ...], num_color_channels, axis=0)  # [C,D,H,W]
+
+                # -------- 6) 对 data & cls_vol_c 用同一个 bbox 裁剪 + pad 到 cls_patch_size --------
                 data_all[j] = crop_and_pad_nd(data, bbox, 0)
+                cls_all[j] = crop_and_pad_nd(cls_vol_c, bbox, 0)
 
             if self.patch_size_was_2d:
                 data_all = data_all[:, :, 0]
+                cls_all = cls_all[:, :, 0]
 
-            # transforms 只需要 image（seg 不用）
+            # -------- 7) 轻度 DA：image & class_label 同步变换 --------
             if self.transforms is not None:
                 with torch.no_grad():
-                    with threadpool_limits(limits=1, user_api=None):
+                    with threadpoolctl.threadpool_limits(limits=1, user_api=None):
                         data_all = torch.from_numpy(data_all).float()
-                        class_labels_all = torch.from_numpy(class_labels_all).long()
+                        cls_all = torch.from_numpy(cls_all).to(torch.int16)
 
                         images = []
+                        cls_maps = []
                         for b in range(self.batch_size):
-                            tmp = self.transforms(**{'image': data_all[b]})
+                            tmp = self.transforms(**{
+                                'image': data_all[b],
+                                'segmentation': cls_all[b]   # 当成一个 segmentation 来做几何变换
+                            })
                             images.append(tmp['image'])
+                            cls_maps.append(tmp['segmentation'])
                         data_all = torch.stack(images)
-                        del images
+                        cls_all = torch.stack(cls_maps)
+                        del images, cls_maps
             else:
                 data_all = torch.from_numpy(data_all).float()
-                class_labels_all = torch.from_numpy(class_labels_all).long()
+                cls_all = torch.from_numpy(cls_all).to(torch.int16)
 
             return {
-                'data': data_all,              # [B, C, *cls_patch_size]
-                'class_label': class_labels_all,
-                'target': [],                  # cls_only 不用 seg
+                'data': data_all,          # [B, C, *cls_patch_size]
+                'class_label': cls_all,    # [B, C, *cls_patch_size]，bg+pancreas=0, lesion=subtype
+                'target': [],              # cls_only 不用 seg
                 'keys': selected_keys
             }
+
 
         # =========================
         # SEG_ONLY / BOTH 模式：原始 nnUNet + 你的 class_label
@@ -299,7 +355,7 @@ class nnUNetDataLoader(DataLoader):
 
         if self.transforms is not None:
             with torch.no_grad():
-                with threadpool_limits(limits=1, user_api=None):
+                with threadpoolctl.threadpool_limits(limits=1, user_api=None):
                     data_all = torch.from_numpy(data_all).float()
                     seg_all = torch.from_numpy(seg_all).to(torch.int16)
                     class_labels_all = torch.from_numpy(class_labels_all).long()
