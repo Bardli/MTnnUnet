@@ -59,6 +59,8 @@ from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
+from nnunetv2.training.loss.tversky import MemoryEfficientTverskyLoss
+from nnunetv2.training.loss.classification_losses import ClassBalancedFocalLoss, LDAMLoss
 from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
 from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.utilities.crossval_split import generate_crossval_split
@@ -78,6 +80,11 @@ from nnunetv2.training.lr_scheduler.warmup import Lin_incr_LRScheduler, PolyLRSc
 # compute validation score
 from sklearn.metrics import f1_score, accuracy_score
 import numpy as np
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except Exception:
+    _WANDB_AVAILABLE = False
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -160,7 +167,7 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250 
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 200
         self.current_epoch = 0
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
@@ -186,6 +193,16 @@ class nnUNetTrainer(object):
         # 初始化时略偏向分割（分类较弱），避免早期不稳定
         self.task_logits = torch.nn.Parameter(torch.tensor([0.0, -0.5], device=self.device))
         self.task_entropy_reg = 0.0  # 可选：>0 防止塌缩，例如 0.01
+        # 任务权重护栏：每个任务的最小权重（Softmax 后再做平滑）
+        # 使用加性平滑：w <- (1 - K*floor) * softmax(logits) + floor，确保 w_i >= floor 且和为 1
+        self.task_weight_floor = 0.05
+        self.use_ldam_switch = True
+        self.ldam_switch_epoch_frac = 0.8
+        self.cbf_beta = 0.9999
+        self.cbf_gamma = 2.0
+        self.ldam_max_m = 0.5
+        self.ldam_s = 30
+        self.cls_counts = None
 
 
 
@@ -224,6 +241,12 @@ class nnUNetTrainer(object):
         self.disable_checkpointing = False
 
         self.was_initialized = False
+
+        # Weights & Biases (optional)
+        self.use_wandb = True
+        self.wandb_run = None
+        self.wandb_project = os.environ.get('WANDB_PROJECT', 'nnunetv2-quiz-3dct')
+        self.wandb_entity = os.environ.get('WANDB_ENTITY', None)
 
         self.print_to_log_file("\n#######################################################################\n"
                                "Please cite the following paper when using nnU-Net:\n"
@@ -513,8 +536,10 @@ class nnUNetTrainer(object):
             # for the loss to prevent invalid indexing in one-hot scatter.
             effective_ignore = self.label_manager.ignore_label if self.label_manager.ignore_label is not None else -1
             loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
-                                   'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
-                                  ignore_label=effective_ignore, dice_class=MemoryEfficientSoftDiceLoss)
+                                   'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp,
+                                   'alpha': 0.3, 'beta': 0.7, 'focal_gamma': 1.5},
+                                  {}, weight_ce=0.3, weight_dice=0.7,
+                                  ignore_label=effective_ignore, dice_class=MemoryEfficientTverskyLoss)
 
         if self._do_i_compile():
             loss.dc = torch.compile(loss.dc)
@@ -1280,13 +1305,10 @@ class nnUNetTrainer(object):
 
                     class_weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
 
-                    # 5. ★ 覆盖原有的 cls_loss，之后 train_step 统一用这个 ★（带 label smoothing）
-                    self.cls_loss = torch.nn.CrossEntropyLoss(weight=class_weights,
-                                                              label_smoothing=self.cls_label_smoothing)
-
-                    self.print_to_log_file(f"Successfully applied weighted CrossEntropyLoss.")
+                    self.cls_counts = counts.tolist()
+                    self.cls_loss = ClassBalancedFocalLoss(self.cls_counts, beta=self.cbf_beta, gamma=self.cbf_gamma)
+                    self.print_to_log_file(f"Successfully applied Class-Balanced Focal Loss.")
                     self.print_to_log_file(f"Class counts (this fold): {counts}")
-                    self.print_to_log_file(f"Class weights (this fold): {weights}")
 
 
         maybe_mkdir_p(self.output_folder)
@@ -1315,6 +1337,47 @@ class nnUNetTrainer(object):
         # we don't really need the fingerprint but its still handy to have it with the others
         shutil.copy(join(self.preprocessed_dataset_folder_base, 'dataset_fingerprint.json'),
                     join(self.output_folder_base, 'dataset_fingerprint.json'))
+
+        # Ensure classification ROI behavior is consistent train/val
+        try:
+            net_mod = self.network.module if self.is_ddp else self.network
+            setattr(net_mod, 'cls_roi_dilate', True)
+        except Exception:
+            pass
+
+        # Initialize Weights & Biases (rank 0 only)
+        if self.local_rank == 0 and self.use_wandb and _WANDB_AVAILABLE:
+            try:
+                run_name = f"{self.plans_manager.dataset_name}__{self.__class__.__name__}__{self.configuration_name}__fold{self.fold}"
+                self.wandb_run = wandb.init(
+                    project=self.wandb_project,
+                    entity=self.wandb_entity,
+                    name=run_name,
+                    config={
+                        'dataset': self.plans_manager.dataset_name,
+                        'configuration': self.configuration_name,
+                        'fold': self.fold,
+                        'initial_lr': self.initial_lr,
+                        'weight_decay': self.weight_decay,
+                        'epochs': self.num_epochs,
+                        'task_mode': self.task_mode,
+                        'enable_deep_supervision': self.enable_deep_supervision,
+                        'oversample_foreground_percent': self.oversample_foreground_percent,
+                        'probabilistic_oversampling': self.probabilistic_oversampling,
+                        'tversky_alpha': 0.3,
+                        'tversky_beta': 0.7,
+                        'tversky_gamma': 1.5,
+                        'cls_loss': 'CB-Focal',
+                        'ldam_switch': getattr(self, 'use_ldam_switch', False),
+                    },
+                    reinit=False,
+                )
+                try:
+                    wandb.save(self.log_file, policy='now')
+                except Exception:
+                    pass
+            except Exception as e:
+                self.print_to_log_file(f"W+B init failed: {e}")
 
         # produces a pdf in output folder
         self.plot_network_architecture()
@@ -1349,6 +1412,18 @@ class nnUNetTrainer(object):
 
         empty_cache(self.device)
         self.print_to_log_file("Training done.")
+        # W&B: upload final log and finish
+        if self.local_rank == 0 and self.use_wandb and _WANDB_AVAILABLE and self.wandb_run is not None:
+            try:
+                art = wandb.Artifact('training_logs', type='log')
+                art.add_file(self.log_file)
+                wandb.log_artifact(art)
+            except Exception:
+                pass
+            try:
+                wandb.finish()
+            except Exception:
+                pass
 
     def on_train_epoch_start(self):
         self.network.train()
@@ -1365,6 +1440,24 @@ class nnUNetTrainer(object):
             f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=5)}")
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
+        # W&B: log LR per-epoch
+        if self.local_rank == 0 and self.use_wandb and _WANDB_AVAILABLE and self.wandb_run is not None:
+            try:
+                wandb.log({'lr': float(self.optimizer.param_groups[0]['lr'])}, step=self.current_epoch)
+            except Exception:
+                pass
+
+        if self.use_ldam_switch and (self.cls_counts is not None):
+            if not hasattr(self, '_switched_to_ldam'):
+                self._switched_to_ldam = False
+            if (not self._switched_to_ldam) and (self.current_epoch >= int(self.ldam_switch_epoch_frac * self.num_epochs)):
+                beta = self.cbf_beta
+                n = np.array(self.cls_counts, dtype=float)
+                eff = (1.0 - beta) / (1.0 - np.clip(np.power(beta, n), 1e-12, None))
+                drw = (len(n) * eff / eff.sum()).tolist()
+                self.cls_loss = LDAMLoss(self.cls_counts, max_m=self.ldam_max_m, s=self.ldam_s, drw_weight=drw)
+                self._switched_to_ldam = True
+                self.print_to_log_file("Switched classification loss to LDAM+DRW.")
 
 
     def train_step(self, batch: dict) -> dict:
@@ -1452,6 +1545,10 @@ class nnUNetTrainer(object):
                 with torch.autocast(device_type=self.device.type, enabled=False):
                     l_cls = self.cls_loss(logits, target_cls)
                 w = torch.softmax(self.task_logits, dim=0)
+                # 加性平滑护栏：保证每个任务权重 >= floor，且总和为 1
+                _k = w.shape[0]
+                _floor = min(self.task_weight_floor, 1.0 / _k - 1e-6)
+                w = w * (1.0 - _k * _floor) + _floor
                 l = w[0] * l_seg + w[1] * l_cls
                 if self.task_entropy_reg > 0:
                     l = l + self.task_entropy_reg * (w * (w.clamp_min(1e-12).log())).sum()
@@ -1507,6 +1604,17 @@ class nnUNetTrainer(object):
         # --- GAI: 记录 seg 和 cls 训练损失 ---
         self.logger.log('train_loss_seg', loss_seg_here, self.current_epoch)
         self.logger.log('train_loss_cls', loss_cls_here, self.current_epoch)
+        # W&B: log train metrics
+        if self.local_rank == 0 and self.use_wandb and _WANDB_AVAILABLE and self.wandb_run is not None:
+            _log = {
+                'train/total_loss': float(loss_here),
+                'train/seg_loss': float(loss_seg_here),
+                'train/cls_loss': float(loss_cls_here),
+            }
+            try:
+                wandb.log(_log, step=self.current_epoch)
+            except Exception:
+                pass
         
 
     def on_validation_epoch_start(self):
@@ -1535,7 +1643,30 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             # 使用 EMA 模型进行验证（若可用）
             net = self.ema_model if getattr(self, 'ema_model', None) is not None else self.network
-            output_seg, output_cls = net(data)
+
+            # Build ROI for classification to mirror train behavior
+            roi_mask_for_cls = None
+            if self.task_mode == 'both':
+                roi_use_gt_epochs = getattr(self, 'roi_use_gt_epochs', 30)
+                if self.current_epoch < roi_use_gt_epochs and target_seg is not None:
+                    seg_hires = target_seg[0] if isinstance(target_seg, list) else target_seg
+                    if seg_hires.ndim == 4:
+                        seg_hires_5d = seg_hires.unsqueeze(1)
+                    elif seg_hires.ndim == 5:
+                        seg_hires_5d = seg_hires
+                    else:
+                        raise RuntimeError(f"Unexpected seg_hires ndim={seg_hires.ndim}, expect 4D or 5D.")
+                    roi_mask_for_cls = (seg_hires_5d > 0).float()
+                    if roi_mask_for_cls.shape[1] != 1:
+                        roi_mask_for_cls = (roi_mask_for_cls > 0).any(dim=1, keepdim=True).float()
+                    # match training: light dilation and clamp
+                    if getattr(self, 'cls_roi_dilate', True):
+                        roi_mask_for_cls = F.max_pool3d(roi_mask_for_cls, kernel_size=3, stride=1, padding=1)
+                    roi_mask_for_cls = roi_mask_for_cls.clamp_min(1e-3)
+                else:
+                    roi_mask_for_cls = None  # use predicted ROI inside model
+
+            output_seg, output_cls = net(data, task_mode=None, roi_mask=roi_mask_for_cls)
             del data
             if mode == 'cls_only':
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
@@ -1555,6 +1686,10 @@ class nnUNetTrainer(object):
                 else:  # both
                     # 统一与 train_step：Softmax 约束权重
                     w = torch.softmax(self.task_logits, dim=0)
+                    # 加性平滑护栏：保证每个任务权重 >= floor，且总和为 1
+                    _k = w.shape[0]
+                    _floor = min(self.task_weight_floor, 1.0 / _k - 1e-6)
+                    w = w * (1.0 - _k * _floor) + _floor
                     l = w[0] * l_seg + w[1] * l_cls
                     if self.task_entropy_reg > 0:
                         l = l + self.task_entropy_reg * (w * (w.clamp_min(1e-12).log())).sum()
@@ -1806,6 +1941,30 @@ class nnUNetTrainer(object):
         # self.logger.log('val_classification_predictions', cls_preds.tolist(),  self.current_epoch)
         self.logger.log('val_macro_f1', macro_f1, self.current_epoch)
         self.logger.log('val_accuracy', accuracy, self.current_epoch)
+        # W&B: log validation metrics
+        if self.local_rank == 0 and self.use_wandb and _WANDB_AVAILABLE and self.wandb_run is not None:
+            log_dict = {
+                'val/total_loss': float(loss_here),
+                'val/seg_loss': float(loss_seg_here),
+                'val/cls_loss': float(loss_cls_here),
+                'val/macro_f1': float(macro_f1),
+                'val/accuracy': float(accuracy),
+                'val/mean_fg_dice': float(mean_fg_dice),
+            }
+            try:
+                for i, v in enumerate(global_dc_per_class):
+                    log_dict[f'val/dice_class_{i+1}'] = float(v)
+            except Exception:
+                pass
+            try:
+                if 'val_dice_whole_pancreas' in self.logger.my_fantastic_logging:
+                    log_dict['val/dice_whole_pancreas'] = float(self.logger.my_fantastic_logging['val_dice_whole_pancreas'][-1])
+            except Exception:
+                pass
+            try:
+                wandb.log(log_dict, step=self.current_epoch)
+            except Exception:
+                pass
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
