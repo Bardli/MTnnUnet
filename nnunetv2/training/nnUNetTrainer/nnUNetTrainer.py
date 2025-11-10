@@ -8,6 +8,7 @@ from copy import deepcopy
 from datetime import datetime
 from time import time, sleep
 from typing import Counter, Tuple, Union, List
+import torch.nn.functional as F
 
 import numpy as np
 import torch
@@ -36,13 +37,15 @@ from batchgeneratorsv2.transforms.utils.pseudo2d import Convert3DTo2DTransform, 
 from batchgeneratorsv2.transforms.utils.random import RandomTransform
 from batchgeneratorsv2.transforms.utils.remove_label import RemoveLabelTansform
 from batchgeneratorsv2.transforms.utils.seg_to_regions import ConvertSegmentationToRegionsTransform
-from torch import autocast, nn
+from torch import autocast, mode, nn
 from torch import distributed as dist
 from torch._dynamo import OptimizedModule
 from torch.cuda import device_count
 from torch import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from nnunetv2.training import lr_scheduler
+from nnunetv2.training.nnUNetTrainer.variants import optimizer
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
@@ -56,6 +59,8 @@ from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
+from nnunetv2.training.loss.tversky import MemoryEfficientTverskyLoss
+from nnunetv2.training.loss.classification_losses import ClassBalancedFocalLoss, LDAMLoss
 from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
 from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.utilities.crossval_split import generate_crossval_split
@@ -75,6 +80,11 @@ from nnunetv2.training.lr_scheduler.warmup import Lin_incr_LRScheduler, PolyLRSc
 # compute validation score
 from sklearn.metrics import f1_score, accuracy_score
 import numpy as np
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except Exception:
+    _WANDB_AVAILABLE = False
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -153,7 +163,7 @@ class nnUNetTrainer(object):
         ### Some hyperparameters for you to fiddle with
         self.initial_lr = 1e-2
         self.weight_decay = 3e-5
-        self.oversample_foreground_percent = 0.33
+        self.oversample_foreground_percent = 0.5
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250 
         self.num_val_iterations_per_epoch = 50
@@ -164,7 +174,38 @@ class nnUNetTrainer(object):
         self.task_mode = 'both'
         print(f"Task mode set to {self.task_mode}")
         self.cls_patch_size = (96, 160, 224)
-        self.cls_num_classes = 3  # number of lesion subtypes
+
+        # ===== BOTH 模式下分类 ROI 课程 & 损失权重（新增默认值） =====
+        self.roi_use_gt_epochs     = 60   # 前60个epoch用GT ROI，之后用预测ROI
+        self.lesion_label_value    = 2    # target_seg里“病灶”标签的整数值（你的数据是0/1/2→病灶=2）
+        # self.lambda_seg_both       = 1.0  # BOTH模式分割损失权重
+        # self.lambda_cls_both_start = 0.5  # 分类权重从0.5线性升到1.0（随epoch）
+        # self.lambda_cls_both_end   = 1.0
+
+        # 分类平滑（用于 CrossEntropyLoss）
+        self.cls_label_smoothing = 0.05
+
+        # EMA 设置
+        self.ema_decay = 0.999
+        self.ema_model = None  # 训练时维护一份 EMA 模型，用于验证/保存
+
+        # 任务权重：Softmax 约束（替代 log-variance 加权）
+        # 初始化时略偏向分割（分类较弱），避免早期不稳定
+        self.task_logits = torch.nn.Parameter(torch.tensor([0.0, -0.5], device=self.device))
+        self.task_entropy_reg = 0.0  # 可选：>0 防止塌缩，例如 0.01
+        # 任务权重护栏：每个任务的最小权重（Softmax 后再做平滑）
+        # 使用加性平滑：w <- (1 - K*floor) * softmax(logits) + floor，确保 w_i >= floor 且和为 1
+        self.task_weight_floor = 0.05
+        self.use_ldam_switch = True
+        self.ldam_switch_epoch_frac = 0.8
+        self.cbf_beta = 0.9999
+        self.cbf_gamma = 2.0
+        self.ldam_max_m = 0.5
+        self.ldam_s = 30
+        self.cls_counts = None
+
+
+
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
         # labels can either be a list of int (regular training) or a list of tuples of int (region-based training)
@@ -201,6 +242,12 @@ class nnUNetTrainer(object):
 
         self.was_initialized = False
 
+        # Weights & Biases (optional)
+        self.use_wandb = True
+        self.wandb_run = None
+        self.wandb_project = os.environ.get('WANDB_PROJECT', 'nnunetv2-quiz-3dct')
+        self.wandb_entity = os.environ.get('WANDB_ENTITY', None)
+
         self.print_to_log_file("\n#######################################################################\n"
                                "Please cite the following paper when using nnU-Net:\n"
                                "Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). "
@@ -232,7 +279,6 @@ class nnUNetTrainer(object):
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
                 self.network = torch.compile(self.network)
-
             self.optimizer, self.lr_scheduler = self.configure_optimizers()
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
@@ -240,8 +286,8 @@ class nnUNetTrainer(object):
                 self.network = DDP(self.network, device_ids=[self.local_rank])
 
             self.seg_loss = self._build_loss()
-            # new classification loss
-            self.cls_loss = torch.nn.CrossEntropyLoss() # 或者 BCEWithLogitsLoss 等
+            # new classification loss (with label smoothing)
+            self.cls_loss = torch.nn.CrossEntropyLoss(label_smoothing=self.cls_label_smoothing)
 
 
 
@@ -265,6 +311,32 @@ class nnUNetTrainer(object):
         else:
             raise RuntimeError("You have called self.initialize even though the trainer was already initialized. "
                                "That should not happen.")
+
+    def _get_model_for_ema(self):
+        mod = self.network.module if self.is_ddp else self.network
+        if isinstance(mod, OptimizedModule):
+            mod = mod._orig_mod
+        return mod
+
+    def _init_ema(self):
+        if self.ema_model is None:
+            src = self._get_model_for_ema()
+            self.ema_model = deepcopy(src).to(self.device)
+            for p in self.ema_model.parameters():
+                p.requires_grad = False
+            self.ema_model.eval()
+
+    def _update_ema(self):
+        if self.ema_model is None:
+            self._init_ema()
+        d = self.ema_decay
+        src = self._get_model_for_ema()
+        with torch.no_grad():
+            for ema_p, p in zip(self.ema_model.parameters(), src.parameters()):
+                ema_p.data.mul_(d).add_(p.data, alpha=(1. - d))
+            # 同步 buffers（如 BN 统计量）
+            for ema_b, b in zip(self.ema_model.buffers(), src.buffers()):
+                ema_b.mul_(d).add_(b, alpha=(1. - d))
 
     def _do_i_compile(self):
         # new default: compile is enabled!
@@ -390,7 +462,8 @@ class nnUNetTrainer(object):
             num_classes=num_output_channels,         # seg 头类别数
             deep_supervision=enable_deep_supervision,
             task_mode=task_mode,
-            cls_num_classes=3,                       # 你自己的分类数
+            cls_num_classes=3, 
+            lesion_channel_idx = 2,                                            # 你自己的分类数
             **architecture_kwargs
         )
 
@@ -565,9 +638,15 @@ class nnUNetTrainer(object):
                                    use_ignore_label=self.label_manager.ignore_label is not None,
                                    dice_class=MemoryEfficientSoftDiceLoss)
         else:
+            # If the dataset does not declare an explicit ignore label, we still need to
+            # ignore padded voxels (-1) produced by cropping. Use -1 as an implicit ignore
+            # for the loss to prevent invalid indexing in one-hot scatter.
+            effective_ignore = self.label_manager.ignore_label if self.label_manager.ignore_label is not None else -1
             loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
-                                   'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
-                                  ignore_label=self.label_manager.ignore_label, dice_class=MemoryEfficientSoftDiceLoss)
+                                   'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp,
+                                   'alpha': 0.3, 'beta': 0.7, 'focal_gamma': 1.5},
+                                  {}, weight_ce=0.3, weight_dice=0.7,
+                                  ignore_label=effective_ignore, dice_class=MemoryEfficientTverskyLoss)
 
         if self._do_i_compile():
             loss.dc = torch.compile(loss.dc)
@@ -684,14 +763,28 @@ class nnUNetTrainer(object):
             lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.num_epochs)
         
         else: # 'seg_only' or 'both'
-            self.print_to_log_file(f"Using {self.task_mode.upper()} mode: Optimizer=SGD, LR_Scheduler=PolyLRScheduler")
-            # 优化器（保持 nnUNet 默认）
-            optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
-                                        momentum=0.99, nesterov=True)
-            # 调度器（保持 nnUNet 默认）
-            lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
-            
+            enc_params, dec_params, cls_params = [], [], []
+            for n, p in self.network.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if 'encoder' in n:
+                    enc_params.append(p)
+                elif any(k in n for k in ['ct_proj', 'dual_block', 'cls_out']):
+                    cls_params.append(p)
+                else:
+                    dec_params.append(p)
+            optimizer = torch.optim.AdamW(
+                [
+                    {'params': enc_params, 'lr': 3e-4},
+                    {'params': dec_params, 'lr': 3e-4},
+                    {'params': cls_params, 'lr': 1e-3},   # 分类头更大一点
+                    {'params': [self.task_logits], 'lr': 1e-3, 'weight_decay': 0.0},  # 任务权重 logits，不做WD
+                ],
+                weight_decay=1e-4
+    )
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.num_epochs)
         return optimizer, lr_scheduler
+
 
     def plot_network_architecture(self):
         if self._do_i_compile():
@@ -809,56 +902,20 @@ class nnUNetTrainer(object):
         if self.dataset_class is None:
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
 
+        # 1) 拿到数据集对象
         dataset_tr, dataset_val = self.get_tr_and_val_datasets()
 
-        # --- 根据 task_mode 选择 patch_size & deep supervision ---
+        # 2) 先根据 task_mode 准备 patch_size 与 transforms（注意顺序，先定义 transforms 再实例化 dataloader）
         if self.task_mode == 'cls_only':
             patch_size = self.cls_patch_size
             deep_supervision_scales = None
-            # ⭐️ 关键改动 (1/2): DA 和验证的 Transform
-            self.print_to_log_file("Using CLS_ONLY mode: Applying LIGHTWEIGHT data augmentation.")
-            (
-                rotation_for_DA,
-                do_dummy_2d_data_aug,
-                initial_patch_size, # cls 模式下这个没用，但要占位
-                mirror_axes,
-            ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
-            
-            # ⭐️ 关键改动 (2/2): 调用新的轻量级 DA
-            tr_transforms = self.get_cls_training_transforms( # 👈 调用新函数
-                patch_size,
-                rotation_for_DA,
-                deep_supervision_scales,
-                mirror_axes,
-                do_dummy_2d_data_aug,
-                use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
-                is_cascaded=self.is_cascaded,
-                foreground_labels=self.label_manager.foreground_labels,
-                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-                ignore_label=self.label_manager.ignore_label
-            )
-            val_transforms = self.get_validation_transforms( # 验证集 DA 保持不变 (几乎没增强)
-                deep_supervision_scales,
-                is_cascaded=self.is_cascaded,
-                foreground_labels=self.label_manager.foreground_labels,
-                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
-                ignore_label=self.label_manager.ignore_label
-            )
-            # --------------------------------------------------
 
-        else: # seg_only / both
-            patch_size = self.configuration_manager.patch_size
-            deep_supervision_scales = self._get_deep_supervision_scales()
-            
-            self.print_to_log_file("Using SEG/BOTH mode: Applying HEAVY data augmentation.")
-            (
-                rotation_for_DA,
-                do_dummy_2d_data_aug,
-                initial_patch_size, # 👈 seg 模式用这个
-                mirror_axes,
-            ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
+            (rotation_for_DA,
+            do_dummy_2d_data_aug,
+            _initial_patch_size,   # cls_only 下不用，但占位
+            mirror_axes) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
 
-            tr_transforms = self.get_training_transforms( # 👈 调用原始的重度 DA
+            tr_transforms = self.get_cls_training_transforms(
                 patch_size,
                 rotation_for_DA,
                 deep_supervision_scales,
@@ -878,61 +935,90 @@ class nnUNetTrainer(object):
                 ignore_label=self.label_manager.ignore_label
             )
 
-        # --- 构造 dataloader (这部分你改的很好，保持不变) ---
-        if self.task_mode == 'cls_only':
+            # 3) 直接用标准 nnUNetDataLoader（无均衡、无 subset_keys）
             dl_tr = nnUNetDataLoader(
                 dataset_tr, self.batch_size,
-                patch_size,          # initial_patch_size (用 cls_patch_size)
-                patch_size,          # final_patch_size (用 cls_patch_size)
+                patch_size,            # initial_patch_size
+                patch_size,            # final_patch_size
                 self.label_manager,
-                task_mode= self.task_mode,
+                task_mode=self.task_mode,
                 oversample_foreground_percent=0.0,
                 sampling_probabilities=None,
                 pad_sides=None,
-                transforms=tr_transforms, # 👈 使用上面选择的 tr_transforms
-                probabilistic_oversampling=False
+                probabilistic_oversampling=False,
+                transforms=tr_transforms
             )
             dl_val = nnUNetDataLoader(
                 dataset_val, self.batch_size,
-                patch_size,
-                patch_size,
+                patch_size,            # initial_patch_size
+                patch_size,            # final_patch_size
                 self.label_manager,
-                task_mode= self.task_mode,
+                task_mode=self.task_mode,
                 oversample_foreground_percent=0.0,
                 sampling_probabilities=None,
                 pad_sides=None,
-                transforms=val_transforms, # 👈 使用上面选择的 val_transforms
-                probabilistic_oversampling=False
-            )
-        else:
-            dl_tr = nnUNetDataLoader(
-                dataset_tr, self.batch_size,
-                initial_patch_size,                      # 👈 seg 模式用 initial_patch_size
-                self.configuration_manager.patch_size,   # 👈 seg 模式用 config 的 patch_size
-                self.label_manager,
-                task_mode= self.task_mode,
-                oversample_foreground_percent=self.oversample_foreground_percent,
-                sampling_probabilities=None,
-                pad_sides=None,
-                transforms=tr_transforms, # 👈 使用上面选择的 tr_transforms
-                probabilistic_oversampling=self.probabilistic_oversampling
-            )
-            dl_val = nnUNetDataLoader(
-                dataset_val, self.batch_size,
-                self.configuration_manager.patch_size,
-                self.configuration_manager.patch_size,
-                self.label_manager,
-                task_mode= self.task_mode,
-                oversample_foreground_percent=self.oversample_foreground_percent,
-                sampling_probabilities=None,
-                pad_sides=None,
-                transforms=val_transforms, # 👈 使用上面选择的 val_transforms
-                probabilistic_oversampling=self.probabilistic_oversampling
+                probabilistic_oversampling=False,
+                transforms=val_transforms
             )
 
-        # --- 多线程 wrapper (保持不变) ---
+        else:
+            # seg_only / both
+            patch_size = self.configuration_manager.patch_size
+            deep_supervision_scales = self._get_deep_supervision_scales()
+
+            (rotation_for_DA,
+            do_dummy_2d_data_aug,
+            initial_patch_size,     # seg/both 下需要：用于 random crop 区间计算
+            mirror_axes) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size(patch_size)
+
+            tr_transforms = self.get_training_transforms(
+                patch_size,
+                rotation_for_DA,
+                deep_supervision_scales,
+                mirror_axes,
+                do_dummy_2d_data_aug,
+                use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+                is_cascaded=self.is_cascaded,
+                foreground_labels=self.label_manager.foreground_labels,
+                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+                ignore_label=self.label_manager.ignore_label
+            )
+            val_transforms = self.get_validation_transforms(
+                deep_supervision_scales,
+                is_cascaded=self.is_cascaded,
+                foreground_labels=self.label_manager.foreground_labels,
+                regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+                ignore_label=self.label_manager.ignore_label
+            )
+
+            # 3) 直接用标准 nnUNetDataLoader（无均衡、无 subset_keys）
+            dl_tr = nnUNetDataLoader(
+                dataset_tr, self.batch_size,
+                initial_patch_size,            # 👈 训练时随机裁剪的“起始尺寸”
+                patch_size,                    # 👈 网络输入的最终尺寸（plans里的 patch_size）
+                self.label_manager,
+                task_mode=self.task_mode,
+                oversample_foreground_percent=self.oversample_foreground_percent,
+                sampling_probabilities=None,
+                pad_sides=None,
+                probabilistic_oversampling=self.probabilistic_oversampling,
+                transforms=tr_transforms
+            )
+            dl_val = nnUNetDataLoader(
+                dataset_val, self.batch_size,
+                patch_size,                    # 验证通常不做 random crop
+                patch_size,
+                self.label_manager,
+                task_mode=self.task_mode,
+                oversample_foreground_percent=self.oversample_foreground_percent,
+                sampling_probabilities=None,
+                pad_sides=None,
+                probabilistic_oversampling=self.probabilistic_oversampling,
+                transforms=val_transforms
+            )
+
+        # 4) 多线程封装（保持与原先一致）
         allowed_num_processes = get_allowed_n_proc_DA()
-        # ... (这部分代码保持你原来的不变) ...
         if allowed_num_processes == 0:
             mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
             mt_gen_val = SingleThreadedAugmenter(dl_val, None)
@@ -951,9 +1037,13 @@ class nnUNetTrainer(object):
                 wait_time=0.002
             )
 
+        # 5) 预热一次，保持与原逻辑一致
         _ = next(mt_gen_train)
         _ = next(mt_gen_val)
         return mt_gen_train, mt_gen_val
+
+
+
 
 
     @staticmethod
@@ -1288,11 +1378,24 @@ class nnUNetTrainer(object):
                 net = self.network
 
             try:
-                num_classes = net.cls_num_classes
+                head = getattr(net, 'classification_head', None)
+                if head is not None:
+                    if isinstance(head, nn.Sequential):
+                        last = list(head.children())[-1]
+                    else:
+                        last = head
+                    num_classes = last.out_features
+                elif hasattr(net, 'cls_out'):
+                    num_classes = net.cls_out.out_features
+                elif hasattr(net, 'cls_num_classes'):
+                    num_classes = net.cls_num_classes
+                else:
+                    raise RuntimeError("no head found")
             except Exception as e:
-                self.print_to_log_file(f"!!! WARNING: Could not determine num_classes from net.cls_num_classes: {e}")
+                self.print_to_log_file(f"!!! WARNING: Could not determine num_classes from model: {e}")
                 self.print_to_log_file("!!! Using UNWEIGHTED cls loss.")
                 num_classes = None
+
 
             if num_classes is not None:
                 counts = np.bincount(tr_labels, minlength=num_classes)
@@ -1307,10 +1410,10 @@ class nnUNetTrainer(object):
 
                     class_weights = torch.tensor(weights, dtype=torch.float32).to(self.device)
 
-                    self.cls_loss = torch.nn.CrossEntropyLoss(weight=class_weights)
-                    self.print_to_log_file(f"Successfully applied weighted CrossEntropyLoss.")
+                    self.cls_counts = counts.tolist()
+                    self.cls_loss = ClassBalancedFocalLoss(self.cls_counts, beta=self.cbf_beta, gamma=self.cbf_gamma)
+                    self.print_to_log_file(f"Successfully applied Class-Balanced Focal Loss.")
                     self.print_to_log_file(f"Class counts (this fold): {counts}")
-                    self.print_to_log_file(f"Class weights (this fold): {weights}")
 
         maybe_mkdir_p(self.output_folder)
 
@@ -1334,6 +1437,48 @@ class nnUNetTrainer(object):
         shutil.copy(join(self.preprocessed_dataset_folder_base, 'dataset_fingerprint.json'),
                     join(self.output_folder_base, 'dataset_fingerprint.json'))
 
+        # Ensure classification ROI behavior is consistent train/val
+        try:
+            net_mod = self.network.module if self.is_ddp else self.network
+            setattr(net_mod, 'cls_roi_dilate', True)
+        except Exception:
+            pass
+
+        # Initialize Weights & Biases (rank 0 only)
+        if self.local_rank == 0 and self.use_wandb and _WANDB_AVAILABLE:
+            try:
+                run_name = f"{self.plans_manager.dataset_name}__{self.__class__.__name__}__{self.configuration_name}__fold{self.fold}"
+                self.wandb_run = wandb.init(
+                    project=self.wandb_project,
+                    entity=self.wandb_entity,
+                    name=run_name,
+                    config={
+                        'dataset': self.plans_manager.dataset_name,
+                        'configuration': self.configuration_name,
+                        'fold': self.fold,
+                        'initial_lr': self.initial_lr,
+                        'weight_decay': self.weight_decay,
+                        'epochs': self.num_epochs,
+                        'task_mode': self.task_mode,
+                        'enable_deep_supervision': self.enable_deep_supervision,
+                        'oversample_foreground_percent': self.oversample_foreground_percent,
+                        'probabilistic_oversampling': self.probabilistic_oversampling,
+                        'tversky_alpha': 0.3,
+                        'tversky_beta': 0.7,
+                        'tversky_gamma': 1.5,
+                        'cls_loss': 'CB-Focal',
+                        'ldam_switch': getattr(self, 'use_ldam_switch', False),
+                    },
+                    reinit=False,
+                )
+                try:
+                    wandb.save(self.log_file, policy='now')
+                except Exception:
+                    pass
+            except Exception as e:
+                self.print_to_log_file(f"W+B init failed: {e}")
+
+        # produces a pdf in output folder
         self.plot_network_architecture()
         self._save_debug_information()
 
@@ -1363,6 +1508,18 @@ class nnUNetTrainer(object):
 
         empty_cache(self.device)
         self.print_to_log_file("Training done.")
+        # W&B: upload final log and finish
+        if self.local_rank == 0 and self.use_wandb and _WANDB_AVAILABLE and self.wandb_run is not None:
+            try:
+                art = wandb.Artifact('training_logs', type='log')
+                art.add_file(self.log_file)
+                wandb.log_artifact(art)
+            except Exception:
+                pass
+            try:
+                wandb.finish()
+            except Exception:
+                pass
 
     def on_train_epoch_start(self):
         self.network.train()
@@ -1379,6 +1536,24 @@ class nnUNetTrainer(object):
             f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=5)}")
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
+        # W&B: log LR per-epoch
+        if self.local_rank == 0 and self.use_wandb and _WANDB_AVAILABLE and self.wandb_run is not None:
+            try:
+                wandb.log({'lr': float(self.optimizer.param_groups[0]['lr'])}, step=self.current_epoch)
+            except Exception:
+                pass
+
+        if self.use_ldam_switch and (self.cls_counts is not None):
+            if not hasattr(self, '_switched_to_ldam'):
+                self._switched_to_ldam = False
+            if (not self._switched_to_ldam) and (self.current_epoch >= int(self.ldam_switch_epoch_frac * self.num_epochs)):
+                beta = self.cbf_beta
+                n = np.array(self.cls_counts, dtype=float)
+                eff = (1.0 - beta) / (1.0 - np.clip(np.power(beta, n), 1e-12, None))
+                drw = (len(n) * eff / eff.sum()).tolist()
+                self.cls_loss = LDAMLoss(self.cls_counts, max_m=self.ldam_max_m, s=self.ldam_s, drw_weight=drw)
+                self._switched_to_ldam = True
+                self.print_to_log_file("Switched classification loss to LDAM+DRW.")
 
 
     def train_step(self, batch: dict) -> dict:
@@ -1399,10 +1574,45 @@ class nnUNetTrainer(object):
         mode = self.task_mode
 
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output_seg, output_cls = self.network(data)
+            # 网络返回 (seg_output, cls_output)
+            # task_mode 的具体梯度逻辑在模型内部处理
+            roi_mask_for_cls = None
+
+            if mode == 'both':
+                # 取最高分辨率的 GT 分割，并规范成 5D (B,1,D,H,W)
+                seg_hires = target_seg[0] if isinstance(target_seg, list) else target_seg
+                if seg_hires.ndim == 4:
+                    seg_hires_5d = seg_hires.unsqueeze(1)        # B×1×DHW
+                elif seg_hires.ndim == 5:
+                    seg_hires_5d = seg_hires                     # B×C×DHW 或 B×1×DHW
+                else:
+                    raise RuntimeError(f"Unexpected seg_hires ndim={seg_hires.ndim}, expect 4D or 5D.")
+
+                # 课程：前 N 个 epoch 用 GT ROI，之后用预测 ROI
+                roi_use_gt_epochs  = getattr(self, 'roi_use_gt_epochs', 30)
+
+                if self.current_epoch < roi_use_gt_epochs:
+                    # ★ 前景联合 ROI（非背景）：兼容 [bg, organ, lesion] 或 [bg, lesion]
+                    # 若是 one-hot，多通道>0 的位置都会被并进 ROI；若是 labelmap，(>0) 即非背景
+                    roi_mask_for_cls = (seg_hires_5d > 0).float()            # B×C?×DHW 或 B×1×DHW
+                    if roi_mask_for_cls.shape[1] != 1:                       # 若出现多通道 -> 聚合成单通道
+                        roi_mask_for_cls = (roi_mask_for_cls > 0).any(dim=1, keepdim=True).float()
+                    # 轻微膨胀，给分类更多上下文
+                    if getattr(self, 'cls_roi_dilate', True):
+                        roi_mask_for_cls = F.max_pool3d(roi_mask_for_cls, kernel_size=3, stride=1, padding=1)
+                    roi_mask_for_cls = roi_mask_for_cls.clamp_min(1e-3)
+                else:
+                    roi_mask_for_cls = None  # 切换到预测 ROI（模型内部会从 seg_output 取前景概率）
+
+            # 传入 roi_mask（B,1,D,H,W 或 None）
+            output_seg, output_cls = self.network(data, task_mode=None, roi_mask=roi_mask_for_cls)
+
+
+
 
             if mode == 'seg_only':
                 self.lambda_seg, self.lambda_cls = 1.0, 0.0
+                # removed debug stats
                 l_seg = self.seg_loss(output_seg, target_seg)
                 l_cls = torch.zeros(1, device=self.device, dtype=l_seg.dtype)
                 l = l_seg
@@ -1410,14 +1620,25 @@ class nnUNetTrainer(object):
             elif mode == 'cls_only':
                 self.lambda_seg, self.lambda_cls = 0.0, 1.0
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
-                l_cls = self._compute_voxel_cls_loss(output_cls, target_cls_map)
+                logits = output_cls.float()
+                with torch.autocast(device_type=self.device.type, enabled=False):
+                    l_cls = self.cls_loss(logits, target_cls)
                 l = l_cls
 
-            else:  # both
-                self.lambda_seg, self.lambda_cls = 1.0, 1.0
+            else:  # mode == 'both'
+                # seg + cls 一起训：Softmax 约束权重
                 l_seg = self.seg_loss(output_seg, target_seg)
-                l_cls = self._compute_voxel_cls_loss(output_cls, target_cls_map)
-                l = self.lambda_seg * l_seg + self.lambda_cls * l_cls
+                logits = output_cls.float()
+                with torch.autocast(device_type=self.device.type, enabled=False):
+                    l_cls = self.cls_loss(logits, target_cls)
+                w = torch.softmax(self.task_logits, dim=0)
+                # 加性平滑护栏：保证每个任务权重 >= floor，且总和为 1
+                _k = w.shape[0]
+                _floor = min(self.task_weight_floor, 1.0 / _k - 1e-6)
+                w = w * (1.0 - _k * _floor) + _floor
+                l = w[0] * l_seg + w[1] * l_cls
+                if self.task_entropy_reg > 0:
+                    l = l + self.task_entropy_reg * (w * (w.clamp_min(1e-12).log())).sum()
 
 
         if self.grad_scaler is not None:
@@ -1426,10 +1647,14 @@ class nnUNetTrainer(object):
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
+            # EMA 更新
+            self._update_ema()
         else:
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
+            # EMA 更新
+            self._update_ema()
 
         return {
             'loss': l.detach().cpu().numpy(),
@@ -1468,10 +1693,23 @@ class nnUNetTrainer(object):
         # --- GAI: 记录 seg 和 cls 训练损失 ---
         self.logger.log('train_loss_seg', loss_seg_here, self.current_epoch)
         self.logger.log('train_loss_cls', loss_cls_here, self.current_epoch)
+        # W&B: log train metrics
+        if self.local_rank == 0 and self.use_wandb and _WANDB_AVAILABLE and self.wandb_run is not None:
+            _log = {
+                'train/total_loss': float(loss_here),
+                'train/seg_loss': float(loss_seg_here),
+                'train/cls_loss': float(loss_cls_here),
+            }
+            try:
+                wandb.log(_log, step=self.current_epoch)
+            except Exception:
+                pass
         
 
     def on_validation_epoch_start(self):
         self.network.eval()
+        if getattr(self, 'ema_model', None) is not None:
+            self.ema_model.eval()
 
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
@@ -1491,18 +1729,58 @@ class nnUNetTrainer(object):
                 target_seg = target_seg.to(self.device, non_blocking=True)
 
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output_seg, output_cls = self.network(data)
-            del data
+            # 使用 EMA 模型进行验证（若可用）
+            net = self.ema_model if getattr(self, 'ema_model', None) is not None else self.network
 
-            # ---- loss 计算 ----
+            # Build ROI for classification to mirror train behavior
+            roi_mask_for_cls = None
+            if self.task_mode == 'both':
+                roi_use_gt_epochs = getattr(self, 'roi_use_gt_epochs', 30)
+                if self.current_epoch < roi_use_gt_epochs and target_seg is not None:
+                    seg_hires = target_seg[0] if isinstance(target_seg, list) else target_seg
+                    if seg_hires.ndim == 4:
+                        seg_hires_5d = seg_hires.unsqueeze(1)
+                    elif seg_hires.ndim == 5:
+                        seg_hires_5d = seg_hires
+                    else:
+                        raise RuntimeError(f"Unexpected seg_hires ndim={seg_hires.ndim}, expect 4D or 5D.")
+                    roi_mask_for_cls = (seg_hires_5d > 0).float()
+                    if roi_mask_for_cls.shape[1] != 1:
+                        roi_mask_for_cls = (roi_mask_for_cls > 0).any(dim=1, keepdim=True).float()
+                    # match training: light dilation and clamp
+                    if getattr(self, 'cls_roi_dilate', True):
+                        roi_mask_for_cls = F.max_pool3d(roi_mask_for_cls, kernel_size=3, stride=1, padding=1)
+                    roi_mask_for_cls = roi_mask_for_cls.clamp_min(1e-3)
+                else:
+                    roi_mask_for_cls = None  # use predicted ROI inside model
+
+            output_seg, output_cls = net(data, task_mode=None, roi_mask=roi_mask_for_cls)
+            del data
             if mode == 'cls_only':
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
-                l_cls = self._compute_voxel_cls_loss(output_cls, target_cls_map)
+                logits_val = output_cls.float()
+                with torch.autocast(device_type=self.device.type, enabled=False):
+                    l_cls = self.cls_loss(logits_val, target_cls)
                 l = l_cls
             else:
+                # seg_only 或 both
+                # removed debug stats
                 l_seg = self.seg_loss(output_seg, target_seg)
-                l_cls = self._compute_voxel_cls_loss(output_cls, target_cls_map)
-                l = l_seg if mode == 'seg_only' else (self.lambda_seg * l_seg + self.lambda_cls * l_cls)
+                logits_val = output_cls.float()
+                with torch.autocast(device_type=self.device.type, enabled=False):
+                    l_cls = self.cls_loss(logits_val, target_cls)
+                if mode == 'seg_only':
+                    l = l_seg
+                else:  # both
+                    # 统一与 train_step：Softmax 约束权重
+                    w = torch.softmax(self.task_logits, dim=0)
+                    # 加性平滑护栏：保证每个任务权重 >= floor，且总和为 1
+                    _k = w.shape[0]
+                    _floor = min(self.task_weight_floor, 1.0 / _k - 1e-6)
+                    w = w * (1.0 - _k * _floor) + _floor
+                    l = w[0] * l_seg + w[1] * l_cls
+                    if self.task_entropy_reg > 0:
+                        l = l + self.task_entropy_reg * (w * (w.clamp_min(1e-12).log())).sum()
 
         # =========================
         # 分割指标（原逻辑保持不变）
@@ -1522,14 +1800,15 @@ class nnUNetTrainer(object):
                 target_seg = target_seg[0]
             axes = [0] + list(range(2, output_seg.ndim))
             if self.label_manager.has_regions:
-                predicted_segmentation_onehot = (torch.sigmoid(output_seg) > 0.5).long()
+                predicted_segmentation_onehot = (torch.sigmoid(output_seg) > 0.5).to(torch.float32)
             else:
-                output_seg_argmax = output_seg.argmax(1)[:, None]
-                predicted_segmentation_onehot = torch.zeros(
-                    output_seg.shape, device=output_seg.device, dtype=torch.float32
-                )
-                predicted_segmentation_onehot.scatter_(1, output_seg_argmax, 1)
-                del output_seg_argmax
+                # Safer one-hot via F.one_hot to avoid scatter index issues
+                C_here = int(output_seg.shape[1])
+                idx = output_seg.argmax(1)  # (B, D, H, W)
+                # removed debug stats
+                idx = idx.clamp_(0, max(C_here - 1, 0))
+                predicted_segmentation_onehot = torch.nn.functional.one_hot(idx, num_classes=C_here)  # (B, D, H, W, C)
+                predicted_segmentation_onehot = predicted_segmentation_onehot.movedim(-1, 1).to(torch.float32)
 
             if self.label_manager.has_ignore_label:
                 if not self.label_manager.has_regions:
@@ -1542,7 +1821,33 @@ class nnUNetTrainer(object):
                         mask = 1 - target_seg[:, -1:]
                     target_seg = target_seg[:, :-1]
             else:
+                # no explicit ignore label in dataset.json. However, padding during cropping may
+                # introduce negative labels (e.g., -1). Those must not be used for metrics.
+                # We therefore mask out all voxels < 0 and set them to background (0) so that
+                # scatter_/one-hot indexing cannot go out of bounds on GPU.
                 mask = None
+                if not self.label_manager.has_regions:
+                    try:
+                        neg = target_seg < 0
+                        if torch.any(neg):
+                            mask = (~neg).float()
+                            target_seg[neg] = 0
+                    except Exception:
+                        # be permissive; if comparison fails due to dtype, just skip
+                        mask = None
+            # 检测目标中的负值（如 -1），将其并入 mask 中，并把负值写回 0，防止后续 one-hot / 统计越界
+            neg = (target_seg < 0)
+            if neg.any():
+                # 将负值位置纳入屏蔽；与已有 mask 取交集
+                add_mask = (~neg).float()
+                mask = add_mask if (mask is None) else (mask * add_mask)
+                # 避免原张量被其他地方引用导致意外改动，先 clone 再写
+                target_seg = target_seg.clone()
+                target_seg[neg] = 0
+
+            # 统一为 float，便于 get_tp_fp_fn_tn 的 mask 乘法
+            if (mask is not None) and (mask.dtype != torch.float32):
+                mask = mask.float()
 
             tp, fp, fn, _ = get_tp_fp_fn_tn(
                 predicted_segmentation_onehot, target_seg, axes=axes, mask=mask
@@ -1556,65 +1861,56 @@ class nnUNetTrainer(object):
                 fp_hard = fp_hard[1:]
                 fn_hard = fn_hard[1:]
 
-        # =========================
-        # 分类 metrics：按 voxel count 决定 case-level 预测
-        # =========================
-        # 1) 解析 GT case label: 从 key 里解析 subtype0/1/2
-        #    假设 identifier: 'quiz_0_041' -> subtype = 0
-        gt_case_labels = []
-        for k in keys:
-            try:
-                gt_case_labels.append(int(k.split('_')[1]))
-            except Exception:
-                gt_case_labels.append(0)  # fallback，至少不崩
-
-        gt_case_labels = torch.as_tensor(gt_case_labels, device=output_cls.device, dtype=torch.long)
-
-        # 2) 预测 case label: voxel-level argmax + voxel count 最大的类
-        if output_cls.ndim == 5:
-            # [B, C, D, H, W]
-            with torch.no_grad():
-                cls_voxel = output_cls.argmax(1)  # [B, D, H, W], 0..C-1
-
-                case_pred = []
-                B = cls_voxel.shape[0]
-
-                # 尝试用 target_cls_map 里 >0 的位置当 lesion mask，只统计 lesion voxel
-                if target_cls_map.ndim == 5 and target_cls_map.shape[1] == 1:
-                    tgt_map = target_cls_map[:, 0]
-                elif target_cls_map.ndim == 4:
-                    tgt_map = target_cls_map
-                else:
-                    tgt_map = None
-
-                for b in range(B):
-                    if tgt_map is not None:
-                        lesion_mask = tgt_map[b] > 0
-                        if lesion_mask.any():
-                            vox = cls_voxel[b][lesion_mask]
-                        else:
-                            vox = cls_voxel[b].reshape(-1)
-                    else:
-                        vox = cls_voxel[b].reshape(-1)
-
-                    # 统计每个 subtype 的 voxel 数
-                    hist = torch.bincount(vox, minlength=self.cls_num_classes)
-                    # argmax -> case-level 预测（0/1/2）
-                    case_pred.append(int(torch.argmax(hist).item()))
-                case_pred = torch.as_tensor(case_pred, device=output_cls.device, dtype=torch.long)
+        # === Whole-pancreas (label>0) union Dice ===
+        if mode == 'cls_only':
+            wp_tp = np.array([0.], dtype=np.float64)
+            wp_fp = np.array([0.], dtype=np.float64)
+            wp_fn = np.array([0.], dtype=np.float64)
         else:
-            # 退化：如果 output_cls 已经是 [B, C]
-            case_pred = output_cls.argmax(1)
+            # 取用于度量的最高分辨率输出/目标
+            if self.enable_deep_supervision:
+                pred_logits_here = output_seg[0]
+                gt_here = target_seg[0]
+            else:
+                pred_logits_here = output_seg
+                gt_here = target_seg
 
+            if self.label_manager.has_regions:
+                pred_onehot_here = (torch.sigmoid(pred_logits_here) > 0.5)
+                pred_union = pred_onehot_here.any(dim=1, keepdim=True)
+                tgt_union = (gt_here > 0).any(dim=1, keepdim=True)
+            else:
+                # argmax->onehot 已在上面得到 predicted_segmentation_onehot
+                pred_union = (predicted_segmentation_onehot[:, 1:, ...].sum(1, keepdim=True) > 0)
+                tgt_union = (gt_here != 0)
+
+            if mask is not None:
+                mbool = mask.bool() if mask.dtype != torch.bool else mask
+                pred_union = pred_union & mbool
+                tgt_union = tgt_union & mbool
+
+            # Compute union TP/FP/FN directly using boolean ops to avoid one-hot scatter
+            pred_b = pred_union.bool()
+            tgt_b = tgt_union.bool()
+            axes_wp = [0] + list(range(2, pred_b.ndim))
+            tp_wp = (pred_b & tgt_b).sum(dim=axes_wp, keepdim=False).to(torch.float32)
+            fp_wp = (pred_b & (~tgt_b)).sum(dim=axes_wp, keepdim=False).to(torch.float32)
+            fn_wp = ((~pred_b) & tgt_b).sum(dim=axes_wp, keepdim=False).to(torch.float32)
+
+            # 汇总成标量（numpy）
+            wp_tp = tp_wp.detach().cpu().numpy().astype(np.float64).sum(0, keepdims=True)
+            wp_fp = fp_wp.detach().cpu().numpy().astype(np.float64).sum(0, keepdims=True)
+            wp_fn = fn_wp.detach().cpu().numpy().astype(np.float64).sum(0, keepdims=True)
+
+        # 在返回值里追加：
         return {
             'loss': l.detach().cpu().numpy(),
             'loss_seg': l_seg.detach().cpu().numpy(),
             'loss_cls': l_cls.detach().cpu().numpy(),
-            'tp_hard': tp_hard,
-            'fp_hard': fp_hard,
-            'fn_hard': fn_hard,
-            'cls_pred': case_pred.detach().cpu().numpy(),         # [B] (0/1/2)
-            'cls_target': gt_case_labels.detach().cpu().numpy(),  # [B] (0/1/2)
+            'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard,
+            'cls_pred': output_cls.detach().cpu().numpy(),
+            'cls_target': target_cls.detach().cpu().numpy(),
+            'wp_tp': wp_tp, 'wp_fp': wp_fp, 'wp_fn': wp_fn,   # ★ NEW
         }
 
 
@@ -1679,6 +1975,43 @@ class nnUNetTrainer(object):
             for i, j, k in zip(tp, fp, fn)
         ]
         mean_fg_dice = np.nanmean(global_dc_per_class)
+        
+        # --- 5. GAI: 计算分类指标 ---
+        # 假设 cls_preds 是 logits/probs，我们需要 argmax 来获取预测类别
+        cls_preds_int = np.argmax(cls_preds, axis=1)
+        
+        # 计算 Macro F1-Score
+        macro_f1 = f1_score(cls_targets, cls_preds_int, average='macro', zero_division=0)
+        # 计算 Accuracy
+        accuracy = accuracy_score(cls_targets, cls_preds_int)
+        # --- Whole-pancreas union Dice 聚合 ---
+        wp_tp = np.sum(outputs_collated['wp_tp'], 0)
+        wp_fp = np.sum(outputs_collated['wp_fp'], 0)
+        wp_fn = np.sum(outputs_collated['wp_fn'], 0)
+
+        if self.is_ddp:
+            world_size = dist.get_world_size()
+            _tp = [None for _ in range(world_size)]
+            _fp = [None for _ in range(world_size)]
+            _fn = [None for _ in range(world_size)]
+            dist.all_gather_object(_tp, wp_tp)
+            dist.all_gather_object(_fp, wp_fp)
+            dist.all_gather_object(_fn, wp_fn)
+            wp_tp = np.vstack(_tp).sum(0)
+            wp_fp = np.vstack(_fp).sum(0)
+            wp_fn = np.vstack(_fn).sum(0)
+
+        den_wp = 2 * wp_tp + wp_fp + wp_fn
+        wp_dice = float(2 * wp_tp / np.maximum(den_wp, 1e-8)) if den_wp.sum() > 0 else 0.0
+        self.logger.log('val_dice_whole_pancreas', wp_dice, self.current_epoch)
+        # also track raw counts per epoch for debugging/analysis
+        try:
+            self.logger.log('val_wp_tp', float(np.array(wp_tp).sum()), self.current_epoch)
+            self.logger.log('val_wp_fp', float(np.array(wp_fp).sum()), self.current_epoch)
+            self.logger.log('val_wp_fn', float(np.array(wp_fn).sum()), self.current_epoch)
+        except Exception:
+            # be lenient if shapes are unexpected
+            pass
 
         # 分类指标（case-level, 已经是 int，不需要 argmax）
         if cls_targets.size > 0:
@@ -1696,20 +2029,50 @@ class nnUNetTrainer(object):
         self.logger.log('val_loss_cls', loss_cls_here, self.current_epoch)
         self.logger.log('val_macro_f1', macro_f1, self.current_epoch)
         self.logger.log('val_accuracy', accuracy, self.current_epoch)
+        # W&B: log validation metrics
+        if self.local_rank == 0 and self.use_wandb and _WANDB_AVAILABLE and self.wandb_run is not None:
+            log_dict = {
+                'val/total_loss': float(loss_here),
+                'val/seg_loss': float(loss_seg_here),
+                'val/cls_loss': float(loss_cls_here),
+                'val/macro_f1': float(macro_f1),
+                'val/accuracy': float(accuracy),
+                'val/mean_fg_dice': float(mean_fg_dice),
+            }
+            try:
+                for i, v in enumerate(global_dc_per_class):
+                    log_dict[f'val/dice_class_{i+1}'] = float(v)
+            except Exception:
+                pass
+            try:
+                if 'val_dice_whole_pancreas' in self.logger.my_fantastic_logging:
+                    log_dict['val/dice_whole_pancreas'] = float(self.logger.my_fantastic_logging['val_dice_whole_pancreas'][-1])
+            except Exception:
+                pass
+            try:
+                wandb.log(log_dict, step=self.current_epoch)
+            except Exception:
+                pass
 
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
 
     def on_epoch_end(self):
-        # 看 encoder bottleneck
-        self.debug_check_param("conv_encoder_blocks.5")   # 最后一层 encoder
+        # 看 encoder 里有没有在更新（整块 encoder）
+        self.debug_check_param("encoder")
 
-        # 看 decoder 最后一层
-        self.debug_check_param("decoder_blocks.0")        # 最靠近输出的 decoder block
+        # 看 decoder 里有没有在更新
+        self.debug_check_param("decoder")
 
-        # 看分类头
-        self.debug_check_param("cls_head")
+        # 看新的分类头：投影层
+        self.debug_check_param("ct_proj")
+
+        # 看 Dual-path Transformer 是否在更新
+        self.debug_check_param("dual_block")
+
+        # 看最终分类输出层
+        self.debug_check_param("cls_out")
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
         # --- GAI: 打印所有训练和验证损失 ---
@@ -1725,8 +2088,10 @@ class nnUNetTrainer(object):
         dice_scores = self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]
         self.print_to_log_file('Pseudo dice (per class)', [np.round(i, decimals=4) for i in dice_scores])
         
-        # 假设 Label 1 = 胰腺, Label 2 = 病灶 (基于 nnU-Net 标签从 1 开始)
-        # `dice_scores` 数组索引 0 对应 Label 1, 索引 1 对应 Label 2
+        if 'val_dice_whole_pancreas' in self.logger.my_fantastic_logging:
+            self.print_to_log_file('Whole-pancreas Dice', 
+                np.round(self.logger.my_fantastic_logging['val_dice_whole_pancreas'][-1], 4))
+
         
         # 计算 Whole Pancreas (Label 1 + Label 2)
         # 注意：这需要修改 validation_step 来计算合并标签的 TP/FP/FN。
@@ -1736,16 +2101,29 @@ class nnUNetTrainer(object):
             self.print_to_log_file(f'  -> Pancreas (Label 1) Dice: {np.round(dice_scores[0], decimals=4)}')
         if len(dice_scores) > 1:
             self.print_to_log_file(f'  -> Lesion (Label 2) Dice: {np.round(dice_scores[1], decimals=4)}')
+
+        # --- GAI: 打印分类指标（macro-average F1 与 accuracy） ---
+        if 'val_macro_f1' in self.logger.my_fantastic_logging and \
+           len(self.logger.my_fantastic_logging['val_macro_f1']) > 0:
+            self.print_to_log_file('Classification macro-average F1', 
+                                   np.round(self.logger.my_fantastic_logging['val_macro_f1'][-1], 4))
+        if 'val_accuracy' in self.logger.my_fantastic_logging and \
+           len(self.logger.my_fantastic_logging['val_accuracy']) > 0:
+            self.print_to_log_file('Classification accuracy', 
+                                   np.round(self.logger.my_fantastic_logging['val_accuracy'][-1], 4))
+
+        # 可选：打印 Whole‑pancreas 的 TP/FP/FN 计数（若已记录）
+        if 'val_wp_tp' in self.logger.my_fantastic_logging and len(self.logger.my_fantastic_logging['val_wp_tp']) > 0:
+            self.print_to_log_file('Whole-pancreas TP', self.logger.my_fantastic_logging['val_wp_tp'][-1])
+        if 'val_wp_fp' in self.logger.my_fantastic_logging and len(self.logger.my_fantastic_logging['val_wp_fp']) > 0:
+            self.print_to_log_file('Whole-pancreas FP', self.logger.my_fantastic_logging['val_wp_fp'][-1])
+        if 'val_wp_fn' in self.logger.my_fantastic_logging and len(self.logger.my_fantastic_logging['val_wp_fn']) > 0:
+            self.print_to_log_file('Whole-pancreas FN', self.logger.my_fantastic_logging['val_wp_fn'][-1])
         
         # 打印 Mean Foreground Dice
         self.print_to_log_file('Mean Foreground Dice', np.round(self.logger.my_fantastic_logging['mean_fg_dice'][-1], decimals=4))
 
-        # --- GAI: 打印分类指标 ---
-        # self.print_to_log_file('val_classification_targets', self.logger.my_fantastic_logging['val_classification_targets'][-1])
-        # self.print_to_log_file('val_classification_predictions', self.logger.my_fantastic_logging['val_classification_predictions'][-1])
-        self.print_to_log_file('val_accuracy', np.round(self.logger.my_fantastic_logging['val_accuracy'][-1], decimals=4))
-        self.print_to_log_file('val_macro_f1', np.round(self.logger.my_fantastic_logging['val_macro_f1'][-1], decimals=4))
-        # --- GAI END ---
+        # 分类详细输出已在上方打印（macro-F1 与 accuracy）
 
         self.print_to_log_file(
             f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
@@ -1789,6 +2167,12 @@ class nnUNetTrainer(object):
                     'trainer_name': self.__class__.__name__,
                     'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
                 }
+                # 若存在 EMA，附带保存（推理端将优先使用）
+                if getattr(self, 'ema_model', None) is not None:
+                    try:
+                        checkpoint['ema_network_weights'] = self.ema_model.state_dict()
+                    except Exception:
+                        pass
                 torch.save(checkpoint, filename)
             else:
                 self.print_to_log_file('No checkpoint written, checkpointing is disabled')
@@ -1831,9 +2215,29 @@ class nnUNetTrainer(object):
             if checkpoint['grad_scaler_state'] is not None:
                 self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
 
+        # 如果存在 EMA 权重，则尝试加载到本地 EMA 模型
+        if 'ema_network_weights' in checkpoint:
+            try:
+                self._init_ema()
+                self.ema_model.load_state_dict(checkpoint['ema_network_weights'])
+            except Exception:
+                pass
+
     def perform_actual_validation(self, save_probabilities: bool = False):
         self.set_deep_supervision_enabled(False)
         self.network.eval()
+        net_for_val = self.ema_model if getattr(self, 'ema_model', None) is not None else self.network
+        # 关闭 EMA 模型上的深监督
+        try:
+            mod = net_for_val.module if isinstance(net_for_val, DDP) else net_for_val
+            if isinstance(mod, OptimizedModule):
+                mod = mod._orig_mod
+            if hasattr(mod, 'decoder'):
+                mod.decoder.deep_supervision = False
+            if hasattr(mod, 'deep_supervision'):
+                mod.deep_supervision = False
+        except Exception:
+            pass
 
         if self.is_ddp and self.batch_size == 1 and self.enable_deep_supervision and self._do_i_compile():
             self.print_to_log_file("WARNING! batch size is 1 during training and torch.compile is enabled. If you "
@@ -1848,7 +2252,7 @@ class nnUNetTrainer(object):
         predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
                                         perform_everything_on_device=True, device=self.device, verbose=False,
                                         verbose_preprocessing=False, allow_tqdm=False)
-        predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
+        predictor.manual_initialization(net_for_val, self.plans_manager, self.configuration_manager, None,
                                         self.dataset_json, self.__class__.__name__,
                                         self.inference_allowed_mirroring_axes)
 
@@ -2090,7 +2494,7 @@ class nnUNetTrainer(object):
 # train
 # nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans 
 # train cls
-# nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans -pretrained_weights F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\bestsig\20251107_best3.pth
+# nnUNetv2_train 002 3d_fullres 5 -p nnUNetResEncUNetMPlans -pretrained_weights F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\bestsig\20251107_best3.pth
 
 # predict
 # nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 5
@@ -2150,6 +2554,8 @@ if __name__ == "__main__":
     trainer.lambda_cls = 1.0
     trainer.seg_loss = nn.CrossEntropyLoss()
     trainer.cls_loss = nn.CrossEntropyLoss()
+
+
 
     # ===============================================================
     # 3️⃣ 构造假数据

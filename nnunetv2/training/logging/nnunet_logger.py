@@ -31,7 +31,12 @@ class nnUNetLogger(object):
             'val_macro_f1': list(),
             'val_accuracy': list(),
             'val_classification_targets': list(),
-            'val_classification_predictions': list()
+            'val_classification_predictions': list(),
+            # Added for whole-pancreas metric & components
+            'val_dice_whole_pancreas': list(),
+            'val_wp_tp': list(),
+            'val_wp_fp': list(),
+            'val_wp_fn': list()
         }
         self.verbose = verbose
         # shut up, this logging is great
