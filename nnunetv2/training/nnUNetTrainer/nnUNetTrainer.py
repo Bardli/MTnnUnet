@@ -176,7 +176,7 @@ class nnUNetTrainer(object):
         self.cls_patch_size = (96, 160, 224)
 
         # ===== BOTH 模式下分类 ROI 课程 & 损失权重（新增默认值） =====
-        self.roi_use_gt_epochs     = 60   # 前60个epoch用GT ROI，之后用预测ROI
+        self.roi_use_gt_epochs     = 20   # 前20个epoch用GT ROI，之后用预测ROI
         self.lesion_label_value    = 2    # target_seg里“病灶”标签的整数值（你的数据是0/1/2→病灶=2）
         # self.lambda_seg_both       = 1.0  # BOTH模式分割损失权重
         # self.lambda_cls_both_start = 0.5  # 分类权重从0.5线性升到1.0（随epoch）
@@ -1570,6 +1570,31 @@ class nnUNetTrainer(object):
 
         target_cls_map = torch.as_tensor(target_cls_map, device=self.device)
 
+        # 统一得到 case-level 的 target（用于 CE），处理 [B] 或 voxel map 的情况
+        if target_cls_map.ndim == 1:
+            target_cls = target_cls_map.long()
+        else:
+            # 优先从 keys 解析（batch 中应包含 'keys': ['quiz_0_xxx', ...]）
+            keys = batch.get('keys', None)
+            target_cls = None
+            if keys is not None:
+                try:
+                    parsed = [int(k.split('_')[1]) for k in keys]
+                    target_cls = torch.as_tensor(parsed, device=self.device, dtype=torch.long)
+                except Exception:
+                    target_cls = None
+            if target_cls is None:
+                # 回退：从 voxel map 多数投票得到 case label
+                tmap = target_cls_map
+                if tmap.ndim == 5 and tmap.shape[1] >= 1:
+                    tmap = tmap[:, 0]
+                elif tmap.ndim != 4:
+                    raise RuntimeError(f"Unexpected class_label shape {tuple(tmap.shape)}")
+                B = tmap.shape[0]
+                flat = tmap.reshape(B, -1).long()
+                # 简单取众数（包含 0），若需要忽略 0 可自行调整
+                target_cls = torch.mode(flat, dim=1).values.to(torch.long)
+
         self.optimizer.zero_grad(set_to_none=True)
         mode = self.task_mode
 
@@ -1719,6 +1744,27 @@ class nnUNetTrainer(object):
 
         data = data.to(self.device, non_blocking=True)
         target_cls_map = torch.as_tensor(target_cls_map, device=self.device)
+
+        # 统一得到 case-level 的 target（用于 CE）
+        if target_cls_map.ndim == 1:
+            target_cls = target_cls_map.long()
+        else:
+            target_cls = None
+            if keys is not None:
+                try:
+                    parsed = [int(k.split('_')[1]) for k in keys]
+                    target_cls = torch.as_tensor(parsed, device=self.device, dtype=torch.long)
+                except Exception:
+                    target_cls = None
+            if target_cls is None:
+                tmap = target_cls_map
+                if tmap.ndim == 5 and tmap.shape[1] >= 1:
+                    tmap = tmap[:, 0]
+                elif tmap.ndim != 4:
+                    raise RuntimeError(f"Unexpected class_label shape {tuple(tmap.shape)}")
+                B = tmap.shape[0]
+                flat = tmap.reshape(B, -1).long()
+                target_cls = torch.mode(flat, dim=1).values.to(torch.long)
 
         mode = self.task_mode
 
@@ -1984,6 +2030,8 @@ class nnUNetTrainer(object):
         macro_f1 = f1_score(cls_targets, cls_preds_int, average='macro', zero_division=0)
         # 计算 Accuracy
         accuracy = accuracy_score(cls_targets, cls_preds_int)
+        # 将预测标准化为 1D int，供后续统一使用
+        cls_preds = cls_preds_int
         # --- Whole-pancreas union Dice 聚合 ---
         wp_tp = np.sum(outputs_collated['wp_tp'], 0)
         wp_fp = np.sum(outputs_collated['wp_fp'], 0)
@@ -2060,19 +2108,19 @@ class nnUNetTrainer(object):
 
     def on_epoch_end(self):
         # 看 encoder 里有没有在更新（整块 encoder）
-        self.debug_check_param("encoder")
+        # self.debug_check_param("encoder")
 
-        # 看 decoder 里有没有在更新
-        self.debug_check_param("decoder")
+        # # 看 decoder 里有没有在更新
+        # self.debug_check_param("decoder")
 
-        # 看新的分类头：投影层
-        self.debug_check_param("ct_proj")
+        # # 看新的分类头：投影层
+        # self.debug_check_param("ct_proj")
 
-        # 看 Dual-path Transformer 是否在更新
-        self.debug_check_param("dual_block")
+        # # 看 Dual-path Transformer 是否在更新
+        # self.debug_check_param("dual_block")
 
-        # 看最终分类输出层
-        self.debug_check_param("cls_out")
+        # # 看最终分类输出层
+        # self.debug_check_param("cls_out")
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
         # --- GAI: 打印所有训练和验证损失 ---

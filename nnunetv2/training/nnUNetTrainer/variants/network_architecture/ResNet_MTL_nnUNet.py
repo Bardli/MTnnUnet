@@ -247,7 +247,8 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
             # 梯度流经 encoder, decoder, 和 cls_branch
             cls_output = self._forward_cls_branch(skips, seg_output, roi_mask)
 
-        return seg_output, cls_voxel_logits  # seg_output: list/tensor; cls_voxel_logits: [B, C_cls, D,H,W]
+        # 返回分割 logits 和分类 logits（分类为每病例 [B, C_cls]）
+        return seg_output, cls_output
 
     # ---- 分类分支：多尺度 pooling + Dual-path Transformer + 记忆原型 ----
     def _forward_cls_branch(self, skips, seg_output, roi_mask: torch.Tensor = None):
