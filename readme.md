@@ -76,7 +76,6 @@ data
     └── ...
 ```
 
-> **Note:** Data distribution is for coursework; do **not** re‑share. The handout discourages use of external datasets or public pre‑trained weights to keep comparisons fair. 
 
 ---
 
@@ -97,7 +96,7 @@ Typical steps:
 
 This repo extends **nnUNetv2** with a **classification head** while keeping the standard training loop. The model exposes both **segmentation logits** and **classification logits**.
 
-> The handout mandates using **nnUNetv2 (3D ResEnc‑M)** as the base framework. 
+
 
 ### 1) Convert to nnUNetv2 structure & plan
 
@@ -201,9 +200,9 @@ Compute **macro‑F1** for **subtype classification**.
 
 
 
-| Model                   | Whole‑Pancreas Dice ↑ | Lesion Dice ↑ | Macro‑F1 (Subtype) ↑ | 95% HD ↓ |
-| ----------------------- | --------------------: | ------------: | -------------------: | -------: |
-| Our multi‑task nnUNetv2 |                     – |             – |                    – |        – |
+| Model                   | Whole‑Pancreas Dice ↑ | Lesion Dice ↑ | Macro‑F1 (Subtype) ↑ |
+| ----------------------- | --------------------: | ------------: | -------------------: | 
+| Our multi‑task nnUNetv2 |                     – |             – |                    – |
 
 
 
