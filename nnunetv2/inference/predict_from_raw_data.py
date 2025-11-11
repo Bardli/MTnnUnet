@@ -45,7 +45,10 @@ class nnUNetPredictor(object):
                  device: torch.device = torch.device('cuda'),
                  verbose: bool = False,
                  verbose_preprocessing: bool = False,
-                 allow_tqdm: bool = True):
+                 allow_tqdm: bool = True,
+                 # --- GAI: 新增分类相关参数 ---
+                 cls_extended_tta: bool = True,
+                 ):
         self.verbose = verbose
         self.verbose_preprocessing = verbose_preprocessing
         self.allow_tqdm = allow_tqdm
@@ -63,6 +66,8 @@ class nnUNetPredictor(object):
             perform_everything_on_device = False
         self.device = device
         self.perform_everything_on_device = perform_everything_on_device
+        # --- GAI: 分类 TTA 控制 ---
+        self.cls_extended_tta = cls_extended_tta
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
@@ -108,6 +113,7 @@ class nnUNetPredictor(object):
             configuration_manager.network_arch_init_kwargs_req_import,
             num_input_channels,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
+            task_mode='both',
             enable_deep_supervision=False
         )
 
@@ -359,8 +365,9 @@ class nnUNetPredictor(object):
         If 'ofile' is None, the result will be returned instead of written to a file
         """
         
-        # --- GAI: 为分类结果添加一个字典 ---
+        # --- GAI: 为分类结果添加两个容器 ---
         all_classification_results = {}
+        subtype_csv_rows = []
         # --- GAI 结束 ---
         
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
@@ -396,7 +403,7 @@ class nnUNetPredictor(object):
                     sleep(0.1)
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
 
-                # --- GAI: 获取 (seg, cls) 两个预测结果 ---
+                # --- GAI: 获取 (seg, cls) 两个预测结果（第一阶段：分割+默认TTA分类） ---
                 prediction_seg, prediction_cls = self.predict_logits_from_preprocessed_data(data)
                 prediction_seg_np = prediction_seg.cpu().detach().numpy()
                 prediction_cls_np = prediction_cls.cpu().detach().numpy()
@@ -430,6 +437,25 @@ class nnUNetPredictor(object):
                     print(f'done with {os.path.basename(ofile)}')
                 else:
                     print(f'\nDone with image of shape {data.shape}:')
+
+                # --- GAI: 第二阶段 - 基于分割ROI的分类TTA软投票（只做分类，不影响分割） ---
+                try:
+                    final_cls_logits = self._classify_with_roi_tta(
+                        data, prediction_seg,
+                        use_extended_tta=self.cls_extended_tta
+                    )
+                    final_cls_np = final_cls_logits.cpu().numpy()
+
+                    # 覆盖 JSON 中此病例的分类结果，并收集到 CSV 行
+                    if ofile is not None:
+                        all_classification_results[case_id] = final_cls_np
+
+                        # 导出为 CSV 的一行：Names + Subtype（将向量变成单个数字标签）
+                        probs = torch.softmax(final_cls_logits, dim=1).cpu().numpy()[0]
+                        pred_label = int(np.argmax(probs))
+                        subtype_csv_rows.append({'Names': case_id, 'Subtype': pred_label})
+                except Exception as e:
+                    print(f'[WARN] ROI-based subtype classification failed for {ofile}: {e}')
             ret = [i.get()[0] for i in r]
 
         if isinstance(data_iterator, MultiThreadedAugmenter):
@@ -441,6 +467,19 @@ class nnUNetPredictor(object):
             print(f"Saving classification results to {join(output_folder, 'classification_results.json')}")
             cls_results_exportable = {k: v.tolist() for k, v in all_classification_results.items()}
             save_json(cls_results_exportable, join(output_folder, 'classification_results.json'))
+
+        # --- GAI: 导出 subtype_results.csv ---
+        if subtype_csv_rows and output_folder is not None:
+            import csv
+            csv_path = join(output_folder, 'subtype_results.csv')
+            print(f"Saving subtype results CSV to {csv_path}")
+            # 固定表头为 Names, Subtype
+            fieldnames = ['Names', 'Subtype']
+            with open(csv_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for r in subtype_csv_rows:
+                    writer.writerow(r)
         # --- GAI 结束 ---
 
         # clear lru cache
@@ -774,6 +813,171 @@ class nnUNetPredictor(object):
             empty_cache(results_device)
             raise e
         return predicted_logits, final_cls_pred # GAI: 返回两个结果
+
+    # --- GAI: 新增 - 基于分割ROI的分类TTA（仅分类，不计算分割重采样），软投票 ---
+    @torch.inference_mode()
+    def _classify_with_roi_tta(self,
+                               data: torch.Tensor,
+                               seg_logits: torch.Tensor,
+                               use_extended_tta: bool = True) -> torch.Tensor:
+        """
+        输入：
+          - data: 预处理后的图像张量 [C, D, H, W]
+          - seg_logits: 分割logits [C_seg, D, H, W]（与 data 对齐的网络空间）
+        过程：
+          - 用 seg_logits 生成 ROI mask：roi = 1 - softmax(seg)[bg]
+          - 滑窗遍历 patch，对每个 patch 进行分类前向。分类时传入 roi_patch 作为 ROI。
+          - TTA：默认包含所有镜像组合；若 use_extended_tta=True，再额外加入 90° 旋转（D-H / H-W / D-W 3 个平面，各 90/270）。
+          - 聚合：对每个 patch，先对 TTA 取平均得到 patch logits，再以 ROI 面积为权重做 patch 级加权平均。
+        返回：病例级 cls logits [1, num_cls]
+        """
+
+        assert isinstance(data, torch.Tensor) and isinstance(seg_logits, torch.Tensor)
+        device_compute = self.device if self.perform_everything_on_device else torch.device('cpu')
+
+        # 构造 ROI mask（连续 [0,1]）
+        with torch.autocast(self.device.type, enabled=(self.device.type == 'cuda')) if self.device.type == 'cuda' else dummy_context():
+            seg_probs = torch.softmax(seg_logits.to(device_compute), dim=0)  # [C_seg, D, H, W]
+            # 使用病灶通道作为 ROI 概率（默认取网络中的 lesion_channel_idx；若不存在则取最后一通道）
+            try:
+                lesion_idx = int(getattr(self.network, 'lesion_channel_idx', seg_probs.shape[0] - 1))
+            except Exception:
+                lesion_idx = seg_probs.shape[0] - 1
+            lesion_idx = max(0, min(lesion_idx, seg_probs.shape[0] - 1))
+            roi_full = seg_probs[lesion_idx:lesion_idx + 1].clamp(0, 1)  # [1, D, H, W]
+            roi_full = roi_full.unsqueeze(0)  # [1,1,D,H,W]
+
+        data = data.to(device_compute)
+        slicers = self._internal_get_sliding_window_slicers(data.shape[1:])
+
+        # 延迟生成 TTA 变换列表：等拿到第一个 patch 再依 shape 决定
+        tta_transforms = None
+        pending_add_rotations = use_extended_tta
+
+        # 分类累加器
+        cls_sum = None
+        w_sum = 0.0
+
+        def apply_transform(x5d: torch.Tensor, r5d: torch.Tensor, t: dict):
+            yx = x5d
+            yr = r5d
+            if "rot" in t:
+                dims, k = t["rot"]
+                yx = torch.rot90(yx, k=k, dims=dims)
+                yr = torch.rot90(yr, k=k, dims=dims)
+            if "flip" in t and len(t["flip"]) > 0:
+                yx = torch.flip(yx, t["flip"]) 
+                yr = torch.flip(yr, t["flip"]) 
+            # 额外安全：将空间维度补齐到网络下采样总步长的倍数，避免奇偶导致的解码器对齐误差
+            try:
+                import numpy as _np
+                strides = _np.array(self.configuration_manager.pool_op_kernel_sizes)  # [n_stages, dims]
+                factors = _np.prod(strides, axis=0).astype(int).tolist()
+            except Exception:
+                factors = None
+            if factors is not None:
+                if yx.ndim == 5:
+                    d, h, w = yx.shape[2], yx.shape[3], yx.shape[4]
+                    fd, fh, fw = (factors + [1, 1, 1])[:3]
+                    pd = (fd - (d % fd)) % fd
+                    ph = (fh - (h % fh)) % fh
+                    pw = (fw - (w % fw)) % fw
+                    if pd or ph or pw:
+                        yx = torch.nn.functional.pad(yx, (0, pw, 0, ph, 0, pd))
+                        yr = torch.nn.functional.pad(yr, (0, pw, 0, ph, 0, pd))
+                elif yx.ndim == 4:
+                    h, w = yx.shape[2], yx.shape[3]
+                    # 2D 配置只取后两维的因子
+                    fh, fw = (factors[-2:]) if len(factors) >= 2 else (1, 1)
+                    ph = (fh - (h % fh)) % fh
+                    pw = (fw - (w % fw)) % fw
+                    if ph or pw:
+                        yx = torch.nn.functional.pad(yx, (0, pw, 0, ph))
+                        yr = torch.nn.functional.pad(yr, (0, pw, 0, ph))
+            return yx, yr
+
+        # 生产者：patch 入队
+        def producer_full(d, slh, q):
+            for s in slh:
+                q.put((torch.clone(d[s][None], memory_format=torch.contiguous_format).to(device_compute), s))
+            q.put('end')
+
+        queue = Queue(maxsize=2)
+        t = Thread(target=producer_full, args=(data, slicers, queue))
+        t.start()
+
+        with tqdm(desc=None, total=len(slicers), disable=not self.allow_tqdm) as pbar:
+            while True:
+                item = queue.get()
+                if item == 'end':
+                    queue.task_done()
+                    break
+                workon, sl = item  # workon: [1,C,Dp,Hp,Wp]
+                spatial_sl = sl[1:]
+                roi_patch = roi_full[(slice(None), slice(None), *spatial_sl)].to(device_compute)  # [1,1,Dp,Hp,Wp]
+
+                # 对该 patch 做多次 TTA 分类，取平均
+                patch_cls_sum = None
+                success_cnt = 0
+                # 懒构建 TTA 列表（包含镜像；可选添加平面内旋转）
+                if tta_transforms is None:
+                    mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
+                    mirror_axes = [] if mirror_axes is None else list(mirror_axes)
+                    # 将允许的 mirror 轴限制在当前 patch 的空间维度范围内
+                    spatial_ndim = workon.ndim - 2  # 2D:2, 3D:3
+                    m_valid = [a for a in mirror_axes if 0 <= a < spatial_ndim]
+                    # map 到张量维度索引（通道之后）
+                    m_axes = [a + 2 for a in m_valid]
+                    combos = [()]
+                    for i in range(len(m_axes)):
+                        for c in itertools.combinations(m_axes, i + 1):
+                            combos.append(c)
+                    tta_transforms = [{"flip": c} for c in combos]
+
+                    # 可选：添加平面内旋转（仅当 H==W 时更安全；避免不对称步长/奇偶导致的形状对齐问题）
+                    if pending_add_rotations:
+                        rot_dims = (3, 4) if workon.ndim == 5 else (2, 3)
+                        for k in (1, 3):  # 90 和 270
+                            tta_transforms.append({"flip": (), "rot": (rot_dims, k)})
+                        pending_add_rotations = False
+
+                for tform in tta_transforms:
+                    x_t, r_t = apply_transform(workon, roi_patch, tform)
+                    try:
+                        try:
+                            out = self.network(x_t, roi_mask=r_t)
+                        except TypeError:
+                            # 兼容不支持 roi_mask 的模型
+                            out = self.network(x_t)
+                        if isinstance(out, (list, tuple)) and len(out) == 2:
+                            _, cls_logits = out
+                        else:
+                            continue
+                        patch_cls_sum = cls_logits if patch_cls_sum is None else (patch_cls_sum + cls_logits)
+                        success_cnt += 1
+                    except Exception as _e:
+                        # 某些旋转可能触发形状不匹配，忽略该 TTA 项
+                        continue
+
+                if patch_cls_sum is not None and success_cnt > 0:
+                    patch_cls_mean = patch_cls_sum / float(success_cnt)
+                    # 用 ROI 面积作为权重（避免全背景patch影响过大）
+                    w = float(roi_patch.mean().detach().cpu().item())
+                    w = max(w, 1e-6)
+                    cls_sum = patch_cls_mean * w if cls_sum is None else (cls_sum + patch_cls_mean * w)
+                    w_sum += w
+
+                queue.task_done()
+                pbar.update()
+        queue.join()
+
+        if cls_sum is None or w_sum <= 0:
+            # 兜底：返回全零
+            b = 1
+            num_cls = getattr(self.network, 'cls_num_classes', 1)
+            return torch.zeros((b, num_cls), device=device_compute)
+        # 由于上面 patch_cls_sum 未除以 TTA 次数，这里将其缩放回平均：
+        return cls_sum / w_sum
 
     @torch.inference_mode()
     def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \

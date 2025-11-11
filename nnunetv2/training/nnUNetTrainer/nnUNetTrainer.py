@@ -167,7 +167,7 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250 
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 100
         self.current_epoch = 0
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
@@ -176,7 +176,7 @@ class nnUNetTrainer(object):
         self.cls_patch_size = (96, 160, 224)
 
         # ===== BOTH 模式下分类 ROI 课程 & 损失权重（新增默认值） =====
-        self.roi_use_gt_epochs     = 20   # 前20个epoch用GT ROI，之后用预测ROI
+        self.roi_use_gt_epochs     = 40   # 前40个epoch用GT ROI，之后用预测ROI
         self.lesion_label_value    = 2    # target_seg里“病灶”标签的整数值（你的数据是0/1/2→病灶=2）
         # self.lambda_seg_both       = 1.0  # BOTH模式分割损失权重
         # self.lambda_cls_both_start = 0.5  # 分类权重从0.5线性升到1.0（随epoch）
@@ -191,11 +191,11 @@ class nnUNetTrainer(object):
 
         # 任务权重：Softmax 约束（替代 log-variance 加权）
         # 初始化时略偏向分割（分类较弱），避免早期不稳定
-        self.task_logits = torch.nn.Parameter(torch.tensor([0.0, -0.5], device=self.device))
+        self.task_logits = torch.nn.Parameter(torch.tensor([0.0, 0.0], device=self.device))
         self.task_entropy_reg = 0.0  # 可选：>0 防止塌缩，例如 0.01
         # 任务权重护栏：每个任务的最小权重（Softmax 后再做平滑）
         # 使用加性平滑：w <- (1 - K*floor) * softmax(logits) + floor，确保 w_i >= floor 且和为 1
-        self.task_weight_floor = 0.05
+        self.task_weight_floor = 0.15
         self.use_ldam_switch = True
         self.ldam_switch_epoch_frac = 0.8
         self.cbf_beta = 0.9999
@@ -231,6 +231,8 @@ class nnUNetTrainer(object):
         self.tr_keys = self.val_keys = None # for cls imbalence place holder
         ### initializing stuff for remembering things and such
         self._best_ema = None
+        # Track best Macro-F1 and save a dedicated checkpoint when improved
+        self._best_macro_f1 = None
 
         ### inference things
         self.inference_allowed_mirroring_axes = None  # this variable is set in
@@ -1441,6 +1443,9 @@ class nnUNetTrainer(object):
         try:
             net_mod = self.network.module if self.is_ddp else self.network
             setattr(net_mod, 'cls_roi_dilate', True)
+            # 同时启用并设置 Top-K ROI 池化默认比例（可被外部覆盖）
+            setattr(net_mod, 'use_topk_pool', True)
+            setattr(net_mod, 'topk_ratio', 0.2)
         except Exception:
             pass
 
@@ -1613,15 +1618,19 @@ class nnUNetTrainer(object):
                 else:
                     raise RuntimeError(f"Unexpected seg_hires ndim={seg_hires.ndim}, expect 4D or 5D.")
 
-                # 课程：前 N 个 epoch 用 GT ROI，之后用预测 ROI
+                # 前 N 个 epoch 用 GT ROI，之后用预测 ROI
                 roi_use_gt_epochs  = getattr(self, 'roi_use_gt_epochs', 30)
 
                 if self.current_epoch < roi_use_gt_epochs:
-                    # ★ 前景联合 ROI（非背景）：兼容 [bg, organ, lesion] 或 [bg, lesion]
-                    # 若是 one-hot，多通道>0 的位置都会被并进 ROI；若是 labelmap，(>0) 即非背景
-                    roi_mask_for_cls = (seg_hires_5d > 0).float()            # B×C?×DHW 或 B×1×DHW
-                    if roi_mask_for_cls.shape[1] != 1:                       # 若出现多通道 -> 聚合成单通道
-                        roi_mask_for_cls = (roi_mask_for_cls > 0).any(dim=1, keepdim=True).float()
+                    # 只使用“病灶”作为 ROI：兼容 one-hot 或 labelmap
+                    if seg_hires_5d.shape[1] == 1:
+                        # labelmap: 取等于病灶标签值的位置为 ROI
+                        lesion_val = getattr(self, 'lesion_label_value', 2)
+                        roi_mask_for_cls = (seg_hires_5d == lesion_val).float()
+                    else:
+                        # one-hot: 直接取病灶通道
+                        lesion_ch = int(max(0, min(getattr(self.network, 'lesion_channel_idx', 2), seg_hires_5d.shape[1] - 1)))
+                        roi_mask_for_cls = (seg_hires_5d[:, lesion_ch:lesion_ch + 1] > 0).float()
                     # 轻微膨胀，给分类更多上下文
                     if getattr(self, 'cls_roi_dilate', True):
                         roi_mask_for_cls = F.max_pool3d(roi_mask_for_cls, kernel_size=3, stride=1, padding=1)
@@ -1790,9 +1799,13 @@ class nnUNetTrainer(object):
                         seg_hires_5d = seg_hires
                     else:
                         raise RuntimeError(f"Unexpected seg_hires ndim={seg_hires.ndim}, expect 4D or 5D.")
-                    roi_mask_for_cls = (seg_hires_5d > 0).float()
-                    if roi_mask_for_cls.shape[1] != 1:
-                        roi_mask_for_cls = (roi_mask_for_cls > 0).any(dim=1, keepdim=True).float()
+                    # 只使用“病灶”作为 ROI：兼容 one-hot 或 labelmap
+                    if seg_hires_5d.shape[1] == 1:
+                        lesion_val = getattr(self, 'lesion_label_value', 2)
+                        roi_mask_for_cls = (seg_hires_5d == lesion_val).float()
+                    else:
+                        lesion_ch = int(max(0, min(getattr(self.network, 'lesion_channel_idx', 2), seg_hires_5d.shape[1] - 1)))
+                        roi_mask_for_cls = (seg_hires_5d[:, lesion_ch:lesion_ch + 1] > 0).float()
                     # match training: light dilation and clamp
                     if getattr(self, 'cls_roi_dilate', True):
                         roi_mask_for_cls = F.max_pool3d(roi_mask_for_cls, kernel_size=3, stride=1, padding=1)
@@ -2189,6 +2202,19 @@ class nnUNetTrainer(object):
             self.print_to_log_file(f"Yayy! New best Mean pseudo Dice: {np.round(self._best_ema, decimals=4)}")
             self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
 
+        # handle 'best macro-f1' checkpointing
+        try:
+            if 'val_macro_f1' in self.logger.my_fantastic_logging and \
+               len(self.logger.my_fantastic_logging['val_macro_f1']) > 0:
+                current_f1 = self.logger.my_fantastic_logging['val_macro_f1'][-1]
+                if (self._best_macro_f1 is None) or (current_f1 > self._best_macro_f1):
+                    self._best_macro_f1 = current_f1
+                    self.print_to_log_file(f"Yayy! New best Macro F1: {np.round(self._best_macro_f1, decimals=4)}")
+                    self.save_checkpoint(join(self.output_folder, 'checkpoint_best_macro_f1.pth'))
+        except Exception as _e:
+            # be lenient: macro-f1 may be missing early on
+            pass
+
         if self.local_rank == 0:
             self.logger.plot_progress_png(self.output_folder)
 
@@ -2210,6 +2236,7 @@ class nnUNetTrainer(object):
                     'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
                     'logging': self.logger.get_checkpoint(),
                     '_best_ema': self._best_ema,
+                    '_best_macro_f1': self._best_macro_f1,
                     'current_epoch': self.current_epoch + 1,
                     'init_args': self.my_init_kwargs,
                     'trainer_name': self.__class__.__name__,
@@ -2244,6 +2271,7 @@ class nnUNetTrainer(object):
         self.current_epoch = checkpoint['current_epoch']
         self.logger.load_checkpoint(checkpoint['logging'])
         self._best_ema = checkpoint['_best_ema']
+        self._best_macro_f1 = checkpoint.get('_best_macro_f1', self._best_macro_f1)
         self.inference_allowed_mirroring_axes = checkpoint[
             'inference_allowed_mirroring_axes'] if 'inference_allowed_mirroring_axes' in checkpoint.keys() else self.inference_allowed_mirroring_axes
 
@@ -2545,7 +2573,7 @@ class nnUNetTrainer(object):
 # nnUNetv2_train 002 3d_fullres 5 -p nnUNetResEncUNetMPlans -pretrained_weights F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\bestsig\20251107_best3.pth
 
 # predict
-# nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 5
+# nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 4 -chk  checkpoint_best.pth
 
 
 if __name__ == "__main__":

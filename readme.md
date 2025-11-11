@@ -1,147 +1,239 @@
-# Welcome to the new nnU-Net!
-
-Click [here](https://github.com/MIC-DKFZ/nnUNet/tree/nnunetv1) if you were looking for the old one instead.
-
-Coming from V1? Check out the [TLDR Migration Guide](documentation/tldr_migration_guide_from_v1.md). Reading the rest of the documentation is still strongly recommended ;-)
-
-## **2025-10-23 There seems to be a [severe performance regression with torch 2.9.0 and 3D convs](https://github.com/pytorch/pytorch/issues/166122) (when using AMP). Please use torch 2.8.0 or lower with nnU-Net!**
 
 
-## **2024-04-18 UPDATE: New residual encoder UNet presets available!**
-Residual encoder UNet presets substantially improve segmentation performance.
-They ship for a variety of GPU memory targets. It's all awesome stuff, promised! 
-Read more :point_right: [here](documentation/resenc_presets.md) :point_left:
+# Multi‑Task nnUNetv2 for Pancreas **Segmentation** and **Subtype Classification** in 3D CT
 
-Also check out our [new paper](https://arxiv.org/pdf/2404.09556.pdf) on systematically benchmarking recent developments in medical image segmentation. You might be surprised!
-
-# What is nnU-Net?
-Image datasets are enormously diverse: image dimensionality (2D, 3D), modalities/input channels (RGB image, CT, MRI, microscopy, ...), 
-image sizes, voxel sizes, class ratio, target structure properties and more change substantially between datasets. 
-Traditionally, given a new problem, a tailored solution needs to be manually designed and optimized  - a process that 
-is prone to errors, not scalable and where success is overwhelmingly determined by the skill of the experimenter. Even 
-for experts, this process is anything but simple: there are not only many design choices and data properties that need to 
-be considered, but they are also tightly interconnected, rendering reliable manual pipeline optimization all but impossible! 
-
-![nnU-Net overview](documentation/assets/nnU-Net_overview.png)
-
-**nnU-Net is a semantic segmentation method that automatically adapts to a given dataset. It will analyze the provided 
-training cases and automatically configure a matching U-Net-based segmentation pipeline. No expertise required on your 
-end! You can simply train the models and use them for your application**.
-
-Upon release, nnU-Net was evaluated on 23 datasets belonging to competitions from the biomedical domain. Despite competing 
-with handcrafted solutions for each respective dataset, nnU-Net's fully automated pipeline scored several first places on 
-open leaderboards! Since then nnU-Net has stood the test of time: it continues to be used as a baseline and method 
-development framework ([9 out of 10 challenge winners at MICCAI 2020](https://arxiv.org/abs/2101.00232) and 5 out of 7 
-in MICCAI 2021 built their methods on top of nnU-Net, 
- [we won AMOS2022 with nnU-Net](https://amos22.grand-challenge.org/final-ranking/))!
-
-Please cite the [following paper](https://www.google.com/url?q=https://www.nature.com/articles/s41592-020-01008-z&sa=D&source=docs&ust=1677235958581755&usg=AOvVaw3dWL0SrITLhCJUBiNIHCQO) when using nnU-Net:
-
-    Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). nnU-Net: a self-configuring 
-    method for deep learning-based biomedical image segmentation. Nature methods, 18(2), 203-211.
+> Official code release for **“Deep Learning for Automatic Cancer Segmentation and Classification in 3D CT Scans.”**
+> A shared 3D encoder (ResNet‑M) with two heads: **segmentation** and **subtype classification**.
+> The system is implemented on top of **nnUNetv2** with ROI‑aware test‑time augmentation (TTA) and produces both `.nii.gz` segmentations and a `subtype_results.csv` for leaderboard submission. The schematic with a **shared image encoder + two heads** appears in the *figure on page 1 of the assignment document*. 
 
 
-## What can nnU-Net do for you?
-If you are a **domain scientist** (biologist, radiologist, ...) looking to analyze your own images, nnU-Net provides 
-an out-of-the-box solution that is all but guaranteed to provide excellent results on your individual dataset. Simply 
-convert your dataset into the nnU-Net format and enjoy the power of AI - no expertise required!
+---
 
-If you are an **AI researcher** developing segmentation methods, nnU-Net:
-- offers a fantastic out-of-the-box applicable baseline algorithm to compete against
-- can act as a method development framework to test your contribution on a large number of datasets without having to 
-tune individual pipelines (for example evaluating a new loss function)
-- provides a strong starting point for further dataset-specific optimizations. This is particularly used when competing 
-in segmentation challenges
-- provides a new perspective on the design of segmentation methods: maybe you can find better connections between 
-dataset properties and best-fitting segmentation pipelines?
+## Environment & Requirements
 
-## What is the scope of nnU-Net?
-nnU-Net is built for semantic segmentation. It can handle 2D and 3D images with arbitrary 
-input modalities/channels. It can understand voxel spacings, anisotropies and is robust even when classes are highly
-imbalanced.
+**Tested OS:** Ubuntu 20.04/22.04 and Windows 10/11
+**Recommended hardware:** ≥8 CPU cores, 32 GB RAM, NVIDIA GPU (≥12 GB VRAM)
+**CUDA:** 11.8 or 12.x (match your PyTorch)
+**Python:** 3.9–3.11
+**PyTorch:** ≥2.1 (uses `torch.compile`/`torch._dynamo`)
 
-nnU-Net relies on supervised learning, which means that you need to provide training cases for your application. The number of 
-required training cases varies heavily depending on the complexity of the segmentation problem. No 
-one-fits-all number can be provided here! nnU-Net does not require more training cases than other solutions - maybe 
-even less due to our extensive use of data augmentation. 
+Install with `pip`:
 
-nnU-Net expects to be able to process entire images at once during preprocessing and postprocessing, so it cannot 
-handle enormous images. As a reference: we tested images from 40x40x40 pixels all the way up to 1500x1500x1500 in 3D 
-and 40x40 up to ~30000x30000 in 2D! If your RAM allows it, larger is always possible.
+```bash
+# (optional) create a fresh environment
+conda create -n pancreas-mtl python=3.10 -y
+conda activate pancreas-mtl
 
-## How does nnU-Net work?
-Given a new dataset, nnU-Net will systematically analyze the provided training cases and create a 'dataset fingerprint'. 
-nnU-Net then creates several U-Net configurations for each dataset: 
-- `2d`: a 2D U-Net (for 2D and 3D datasets)
-- `3d_fullres`: a 3D U-Net that operates on a high image resolution (for 3D datasets only)
-- `3d_lowres` → `3d_cascade_fullres`: a 3D U-Net cascade where first a 3D U-Net operates on low resolution images and 
-then a second high-resolution 3D U-Net refined the predictions of the former (for 3D datasets with large image sizes only)
+# install CUDA-specific torch first (adjust version for your system)
+pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-**Note that not all U-Net configurations are created for all datasets. In datasets with small image sizes, the 
-U-Net cascade (and with it the 3d_lowres configuration) is omitted because the patch size of the full 
-resolution U-Net already covers a large part of the input images.**
+# repo deps
+pip install -r requirements.txt
 
-nnU-Net configures its segmentation pipelines based on a three-step recipe:
-- **Fixed parameters** are not adapted. During development of nnU-Net we identified a robust configuration (that is, certain architecture and training properties) that can 
-simply be used all the time. This includes, for example, nnU-Net's loss function, (most of the) data augmentation strategy and learning rate.
-- **Rule-based parameters** use the dataset fingerprint to adapt certain segmentation pipeline properties by following 
-hard-coded heuristic rules. For example, the network topology (pooling behavior and depth of the network architecture) 
-are adapted to the patch size; the patch size, network topology and batch size are optimized jointly given some GPU 
-memory constraint. 
-- **Empirical parameters** are essentially trial-and-error. For example the selection of the best U-net configuration 
-for the given dataset (2D, 3D full resolution, 3D low resolution, 3D cascade) and the optimization of the postprocessing strategy.
+# editable install (so console scripts are available)
+pip install -e .
+```
 
-## How to get started?
-Read these:
-- [Installation instructions](documentation/installation_instructions.md)
-- [Dataset conversion](documentation/dataset_format.md)
-- [Usage instructions](documentation/how_to_use_nnunet.md)
+**What’s in `requirements.txt` (minimal):**
 
-Additional information:
-- [Learning from sparse annotations (scribbles, slices)](documentation/ignore_label.md)
-- [Region-based training](documentation/region_based_training.md)
-- [Manual data splits](documentation/manual_data_splits.md)
-- [Pretraining and finetuning](documentation/pretraining_and_finetuning.md)
-- [Intensity Normalization in nnU-Net](documentation/explanation_normalization.md)
-- [Manually editing nnU-Net configurations](documentation/explanation_plans_files.md)
-- [Extending nnU-Net](documentation/extending_nnunet.md)
-- [What is different in V2?](documentation/changelog.md)
+```
+nnunetv2>=2.4
+tqdm
+numpy
+acvl-utils
+batchgenerators
+torch>=2.1
+```
 
-Competitions:
-- [AutoPET II](documentation/competitions/AutoPETII.md)
+---
 
-[//]: # (- [Ignore label]&#40;documentation/ignore_label.md&#41;)
+## Dataset
 
-## Where does nnU-Net perform well and where does it not perform?
-nnU-Net excels in segmentation problems that need to be solved by training from scratch, 
-for example: research applications that feature non-standard image modalities and input channels,
-challenge datasets from the biomedical domain, majority of 3D segmentation problems, etc . We have yet to find a 
-dataset for which nnU-Net's working principle fails!
+This project uses cropped **pancreas CT ROIs** so it runs on free GPUs (Colab T4 / Kaggle P100). *The handout specifies that the original large 3D scans were cropped to smaller ROIs.* 
 
-Note: On standard segmentation 
-problems, such as 2D RGB images in ADE20k and Cityscapes, fine-tuning a foundation model (that was pretrained on a large corpus of 
-similar images, e.g. Imagenet 22k, JFT-300M) will provide better performance than nnU-Net! That is simply because these 
-models allow much better initialization. Foundation models are not supported by nnU-Net as 
-they 1) are not useful for segmentation problems that deviate from the standard setting (see above mentioned 
-datasets), 2) would typically only support 2D architectures and 3) conflict with our core design principle of carefully adapting 
-the network topology for each dataset (if the topology is changed one can no longer transfer pretrained weights!) 
+**Splits (training/validation counts by subtype):**
+Train: **62 / 106 / 84**, Validation: **9 / 15 / 12** for **Subtype 0 / 1 / 2**, respectively. 
 
-## What happened to the old nnU-Net?
-The core of the old nnU-Net was hacked together in a short time period while participating in the Medical Segmentation 
-Decathlon challenge in 2018. Consequently, code structure and quality were not the best. Many features 
-were added later on and didn't quite fit into the nnU-Net design principles. Overall quite messy, really. And annoying to work with.
+**Folder structure (as provided):** 
 
-nnU-Net V2 is a complete overhaul. The "delete everything and start again" kind. So everything is better 
-(in the author's opinion haha). While the segmentation performance [remains the same](https://docs.google.com/spreadsheets/d/13gqjIKEMPFPyMMMwA1EML57IyoBjfC3-QCTn4zRN_Mg/edit?usp=sharing), a lot of cool stuff has been added. 
-It is now also much easier to use it as a development framework and to manually fine-tune its configuration to new 
-datasets. A big driver for the reimplementation was also the emergence of [Helmholtz Imaging](http://helmholtz-imaging.de), 
-prompting us to extend nnU-Net to more image formats and domains. Take a look [here](documentation/changelog.md) for some highlights.
+```
+data
+├── train
+│   ├── subtype0
+│   │   ├── quiz_0_041.nii.gz           # mask (0=background; 1=pancreas; 2=lesion)
+│   │   ├── quiz_0_041_0000.nii.gz      # image
+│   ├── subtype1
+│   └── subtype2
+├── validation
+│   ├── subtype0
+│   │   ├── quiz_0_168.nii.gz
+│   │   ├── quiz_0_168_0000.nii.gz
+│   ├── subtype1
+│   └── subtype2
+└── test                                # only images
+    ├── quiz_037_0000.nii.gz
+    ├── quiz_045_0000.nii.gz
+    └── ...
+```
 
-# Acknowledgements
-<img src="documentation/assets/HI_Logo.png" height="100px" />
+> **Note:** Data distribution is for coursework; do **not** re‑share. The handout discourages use of external datasets or public pre‑trained weights to keep comparisons fair. 
 
-<img src="documentation/assets/dkfz_logo.png" height="100px" />
+---
 
-nnU-Net is developed and maintained by the Applied Computer Vision Lab (ACVL) of [Helmholtz Imaging](http://helmholtz-imaging.de) 
-and the [Division of Medical Image Computing](https://www.dkfz.de/en/mic/index.php) at the 
-[German Cancer Research Center (DKFZ)](https://www.dkfz.de/en/index.html).
+## Preprocessing
+
+We rely on **nnUNetv2**’s out‑of‑the‑box pipeline (spacing, padding/cropping, normalization). The supplied dataset already provides **ROI crops**, which greatly reduces memory and runtime. 
+
+Typical steps:
+
+* **Cropping**: already applied (ROI data). 
+* **Intensity normalization**: nnUNetv2 default per‑case normalization via plans.
+* **Resampling**: as defined in `plans.json` (handled automatically).
+
+
+---
+
+## Training
+
+This repo extends **nnUNetv2** with a **classification head** while keeping the standard training loop. The model exposes both **segmentation logits** and **classification logits**.
+
+> The handout mandates using **nnUNetv2 (3D ResEnc‑M)** as the base framework. 
+
+### 1) Convert to nnUNetv2 structure & plan
+
+```bash
+# set your nnUNet paths (example)
+export nnUNet_raw=/path/to/nnUNet_raw
+export nnUNet_preprocessed=/path/to/nnUNet_preprocessed
+export nnUNet_results=/path/to/nnUNet_results
+
+# Suppose your dataset id is 999 and name is Dataset999_PancreasQuiz
+# Prepare JSONs & copy NIfTI into the nnUNetv2 directory layout before this step.
+
+nnUNetv2_plan_and_preprocess -d 999 -c 3d_fullres -pl nnUNetPlans -np 8
+```
+
+### 2) Train (fold 0 as example)
+
+```bash
+# base trainer name stays "nnUNetTrainer" unless you created a custom subclass
+nnUNetv2_train 999 3d_fullres nnUNetTrainer 0 -p nnUNetPlans
+```
+
+**Tracking & reporting:** the assignment asks you to **log training/validation curves and metrics for both segmentation and classification via Weights & Biases (wandb)**—please enable `wandb` in your trainer or scripts. 
+
+**On class imbalance / overfitting:** you must describe your strategies in the report (e.g., loss weighting, focal loss, oversampling, augmentation, early stopping/regularization); these are part of the mandatory checklist. 
+
+
+
+---
+
+## Inference
+
+We provide two CLI entry points compatible with nnUNetv2:
+
+### A) Predict **by dataset id** (preferred)
+
+```bash
+nnUNetv2_predict \
+  -i /path/to/test/images \
+  -o /path/to/preds \
+  -d 999 \
+  -p nnUNetPlans \
+  -tr nnUNetTrainer \
+  -c 3d_fullres \
+  -f 0 1 2 3 4 \
+  -step_size 0.5 \
+  -device cuda \
+  -npp 3 -nps 3
+# add --disable_tta to turn off mirror TTA
+```
+
+### B) Predict **from a model folder**
+
+```bash
+nnUNetv2_predict_from_modelfolder \
+  -i /path/to/test/images \
+  -o /path/to/preds \
+  -m /path/to/nnUNet_results/.../fold_* \
+  -f 0 1 2 3 4 \
+  -chk checkpoint_final.pth \
+  -device cuda
+```
+
+**Outputs produced:**
+
+* Segmentation NIfTI for each case (same basename as input).
+* `classification_results.json` — raw classification logits/probabilities per case.
+* `subtype_results.csv` — **exact submission format** with two columns: `Names, Subtype`.
+  Example required by the handout:
+
+  ```
+  Names,Subtype
+  quiz_037.nii.gz,0
+  quiz_045.nii.gz,1
+  quiz_047.nii.gz,2
+  ```
+
+  (CSV formatting and columns are required as specified on *page 3*.) 
+
+**What the code does differently at inference (high‑level):**
+
+* Sliding‑window prediction for **segmentation** (Gaussian‑weighted stitching).
+* **Classification** is computed per patch, aggregated with **foreground‑probability weights**, and supports **ROI‑aware TTA**; final case‑level logits are exported (and `subtype_results.csv` is written automatically when `-o` is set).
+
+
+---
+
+## Evaluation
+
+Compute **Dice** for:
+
+* **Whole pancreas**: `label > 0` (labels 1 + 2).
+* **Lesion**: `label == 2`.
+
+Compute **macro‑F1** for **subtype classification**.
+
+
+---
+
+## Results
+
+
+
+| Model                   | Whole‑Pancreas Dice ↑ | Lesion Dice ↑ | Macro‑F1 (Subtype) ↑ | 95% HD ↓ |
+| ----------------------- | --------------------: | ------------: | -------------------: | -------: |
+| Our multi‑task nnUNetv2 |                     – |             – |                    – |        – |
+
+
+
+---
+
+
+## Colab / Jupyter
+
+Add a notebook that:
+
+1. Installs this repo,
+2. Downloads/places the dataset,
+3. Runs `nnUNetv2_plan_and_preprocess`, `nnUNetv2_train`, and `nnUNetv2_predict`,
+4. Produces `subtype_results.csv`.
+
+---
+
+
+## Contributing & License
+
+Contributions are welcome (issues, pull requests). Please add unit tests where possible.
+License: choose one that fits (e.g., **MIT** or **Apache‑2.0**). Add a `LICENSE` file to the repo.
+
+---
+
+## Acknowledgements
+
+We thank the maintainers of **nnUNetv2** and the providers of public datasets and benchmarking guidance. See “Related Work” and references in the assignment (nnU‑Net, Metrics Reloaded, etc.). 
+
+
+
+
+

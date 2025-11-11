@@ -174,6 +174,8 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         self.task_mode = task_mode
         self.cls_num_classes = cls_num_classes
         self.num_classes = num_classes  # seg 类别数（含背景）
+        # 记录病灶通道索引，供 ROI 选择使用
+        self.lesion_channel_idx = lesion_channel_idx
 
         # --- encoder 各 stage 通道数 ---
         if isinstance(features_per_stage, int):
@@ -195,6 +197,11 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         self.prototype_memory = nn.Parameter(
             torch.randn(cls_num_classes, self.d_model) * 0.02
         )
+        # 默认启用 Top-K ROI 池化，并提高比例到 0.2（可被外部覆盖）
+        self.use_topk_pool = True
+        self.topk_ratio = 0.2
+        # 分类 ROI 轻微膨胀，默认开启（可被外部覆盖）
+        self.cls_roi_dilate = True
 
         # 单层 Dual-path Transformer block
         self.dual_block = DualPathTransformerBlock(
@@ -261,7 +268,10 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         else:
             seg_logits = (seg_output[0] if isinstance(seg_output, (list, tuple)) else seg_output).float()
             probs = F.softmax(seg_logits, dim=1)
-            lesion_mask_hires = (1.0 - probs[:, 0:1, ...]).detach()
+            # 使用“病灶”通道作为 ROI，而非 1 - P(bg)
+            lesion_idx = getattr(self, 'lesion_channel_idx', probs.shape[1] - 1)
+            lesion_idx = int(max(0, min(lesion_idx, probs.shape[1] - 1)))
+            lesion_mask_hires = probs[:, lesion_idx:lesion_idx + 1, ...].detach()
             if getattr(self, 'cls_roi_dilate', False):
                 lesion_mask_hires = F.max_pool3d(lesion_mask_hires, kernel_size=3, stride=1, padding=1)
 
