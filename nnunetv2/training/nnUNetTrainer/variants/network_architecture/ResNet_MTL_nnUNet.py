@@ -10,7 +10,15 @@ from dynamic_network_architectures.initialization.weight_init import (
 )
 from torch.amp import autocast as autocast_cuda
 
-
+class NormedLinear(nn.Linear):
+    def __init__(self, in_features, out_features, s=30.):
+        super().__init__(in_features, out_features, bias=False)
+        self.s = s
+        nn.init.xavier_normal_(self.weight)
+    def forward(self, x):
+        x = F.normalize(x, dim=-1)
+        w = F.normalize(self.weight, dim=-1)
+        return self.s * F.linear(x, w)
 class DualPathTransformerBlock(nn.Module):
     """
     轻量版 Dual-path Transformer：
@@ -213,7 +221,9 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         )
 
         # 最后的分类头：直接用 ct_token 的表示做线性分类
-        self.cls_out = nn.Linear(self.d_model, cls_num_classes)
+        # self.cls_out = nn.Linear(self.d_model, cls_num_classes)
+        # 归一化余弦分类器”（CosFace/ArcFace 风格）
+        self.cls_out = NormedLinear(self.d_model, cls_num_classes, s=30.)
 
         # 初始化（卷积/线性等）
         InitWeights_He(1e-2)(self)
@@ -294,13 +304,27 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
                 area = roi_resized.sum(dim=(2, 3, 4))
                 valid = (area > 16).squeeze(1)
 
+                # if use_topk and valid.any():
+                #     # 只在有效样本上做 top‑k，其他回退 GAP
+                #     tk_all = self.topk_pool(feat, roi_resized, k=topk_ratio)  # [B,C]
+                #     gap_all = feat.mean(dim=(2, 3, 4))                        # [B,C]
+                #     pooled = torch.where(valid.view(B, 1), tk_all, gap_all)
+                # else:
+                #     pooled = feat.mean(dim=(2, 3, 4))
+                
+                
+                # ROI 加权平均 + 自适应 Top‑K
+                eps = 1e-6
+                w = roi_resized / (roi_resized.sum(dim=(2,3,4), keepdim=True) + eps)
+                w_mean = (feat * w).sum(dim=(2,3,4))  # [B,C]
+                # 小 ROI（面积<16）回退到 Top‑K 或 GAP
                 if use_topk and valid.any():
-                    # 只在有效样本上做 top‑k，其他回退 GAP
-                    tk_all = self.topk_pool(feat, roi_resized, k=topk_ratio)  # [B,C]
-                    gap_all = feat.mean(dim=(2, 3, 4))                        # [B,C]
-                    pooled = torch.where(valid.view(B, 1), tk_all, gap_all)
+                    tk_all = self.topk_pool(feat, roi_resized, k=min(0.5, max(0.05, float(self.topk_ratio))))
+                    gap_all = feat.mean(dim=(2, 3, 4))
+                    pooled = torch.where(valid.view(B, 1), w_mean, gap_all) * 0.7 + \
+                                torch.where(valid.view(B, 1), tk_all, gap_all) * 0.3
                 else:
-                    pooled = feat.mean(dim=(2, 3, 4))
+                    pooled = w_mean
 
                 pooled_feats.append(pooled)
 

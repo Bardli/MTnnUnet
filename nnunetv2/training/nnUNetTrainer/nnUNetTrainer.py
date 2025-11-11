@@ -167,7 +167,7 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250 
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 200
         self.current_epoch = 0
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
@@ -178,9 +178,7 @@ class nnUNetTrainer(object):
         # ===== BOTH 模式下分类 ROI 课程 & 损失权重（新增默认值） =====
         self.roi_use_gt_epochs     = 40   # 前40个epoch用GT ROI，之后用预测ROI
         self.lesion_label_value    = 2    # target_seg里“病灶”标签的整数值（你的数据是0/1/2→病灶=2）
-        # self.lambda_seg_both       = 1.0  # BOTH模式分割损失权重
-        # self.lambda_cls_both_start = 0.5  # 分类权重从0.5线性升到1.0（随epoch）
-        # self.lambda_cls_both_end   = 1.0
+
 
         # 分类平滑（用于 CrossEntropyLoss）
         self.cls_label_smoothing = 0.05
@@ -197,7 +195,9 @@ class nnUNetTrainer(object):
         # 使用加性平滑：w <- (1 - K*floor) * softmax(logits) + floor，确保 w_i >= floor 且和为 1
         self.task_weight_floor = 0.15
         self.use_ldam_switch = True
-        self.ldam_switch_epoch_frac = 0.8
+
+        self.ldam_switch_epoch_frac = 0.5
+
         self.cbf_beta = 0.9999
         self.cbf_gamma = 2.0
         self.ldam_max_m = 0.5
@@ -2575,7 +2575,8 @@ class nnUNetTrainer(object):
 # predict
 # nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 4 -chk  checkpoint_best_macro_f1.pth
 # nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 4 -chk  checkpoint_best.pth
-
+# submission
+# nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\test -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\Baidu_Li_Results -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 4 -chk  checkpoint_best_macro_f1.pth
 
 if __name__ == "__main__":
     import torch
