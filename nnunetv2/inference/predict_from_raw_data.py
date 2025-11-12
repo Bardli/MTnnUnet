@@ -104,6 +104,9 @@ class nnUNetPredictor(object):
         num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
         trainer_class = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
                                                     trainer_name, 'nnunetv2.training.nnUNetTrainer')
+
+
+
         if trainer_class is None:
             raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnunetv2.training.nnUNetTrainer. '
                                f'Please place it there (in any .py file)!')
@@ -116,6 +119,7 @@ class nnUNetPredictor(object):
             task_mode='both',
             enable_deep_supervision=False
         )
+
 
         self.plans_manager = plans_manager
         self.configuration_manager = configuration_manager
@@ -421,6 +425,10 @@ class nnUNetPredictor(object):
                     # --- GAI: 保存 cls 结果 ---
                     case_id = os.path.basename(ofile)
                     all_classification_results[case_id] = prediction_cls_np
+                    # 同时基于第一阶段分类结果写入 CSV（整例 softmax argmax）
+                    probs = torch.softmax(prediction_cls, dim=1).cpu().numpy()[0]
+                    pred_label = int(np.argmax(probs))
+                    subtype_csv_rows.append({'Names': case_id, 'Subtype': pred_label})
                     # --- GAI 结束 ---
                 else:
                     print('sending off prediction to background worker for resampling')
@@ -437,6 +445,9 @@ class nnUNetPredictor(object):
                     print(f'done with {os.path.basename(ofile)}')
                 else:
                     print(f'\nDone with image of shape {data.shape}:')
+
+                # 单阶段推理：跳过 ROI 驱动的第二阶段分类细化
+                continue
 
                 # --- GAI: 第二阶段 - 基于分割ROI的分类TTA软投票（只做分类，不影响分割） ---
                 try:

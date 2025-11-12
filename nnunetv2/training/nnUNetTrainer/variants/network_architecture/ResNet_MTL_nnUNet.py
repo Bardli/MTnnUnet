@@ -77,48 +77,57 @@ class DualPathTransformerBlock(nn.Module):
 
     def forward(
         self,
-        ct_token: torch.Tensor,   # [B, 1, D]
-        mem_tokens: torch.Tensor  # [B, M, D]
+        ct_tokens: torch.Tensor,   # [B, N, D]，N 可以是 1 或 2
+        mem_tokens: torch.Tensor   # [B, M, D]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # === 强制用 float32，避免 AMP 下 multiheadattention 溢出 ===
         # ct_token = ct_token.float()
         # mem_tokens = mem_tokens.float()
-        orig_dtype = ct_token.dtype
+        orig_dtype = ct_tokens.dtype
         # ----- 路径1: ct <- mem -----
-        ct_res = ct_token
+        ct_res = ct_tokens
         mem_res = mem_tokens
 
-        ct_norm = self.norm_ct1(ct_token).float()
-        mem_norm = self.norm_mem1(mem_tokens).float()
+        # 使用更稳定且高吞吐的 BF16（若可用），以启用 SDPA/FlashAttention 快路径
+        try:
+            attn_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else orig_dtype
+        except Exception:
+            attn_dtype = orig_dtype
+
+        ct_norm = self.norm_ct1(ct_tokens).to(attn_dtype)
+        mem_norm = self.norm_mem1(mem_tokens).to(attn_dtype)
         ct_updated, _ = self.attn_ct_from_mem(query=ct_norm, key=mem_norm, value=mem_norm, need_weights=False)
-        ct_token = ct_res + ct_updated.to(orig_dtype)
+        ct_tokens = ct_res + ct_updated.to(orig_dtype)
 
         # ----- 路径2: mem <- ct -----
-        ct_norm2 = self.norm_ct2(ct_token).float()
-        mem_norm2 = self.norm_mem2(mem_tokens).float()
+        ct_norm2 = self.norm_ct2(ct_tokens).to(attn_dtype)
+        mem_norm2 = self.norm_mem2(mem_tokens).to(attn_dtype)
         mem_updated, _ = self.attn_mem_from_ct(query=mem_norm2, key=ct_norm2, value=ct_norm2, need_weights=False)
         mem_tokens = mem_res + mem_updated.to(orig_dtype)
 
         # ----- FFN + 残差 -----
-        ct_ff = self.ff_ct(ct_token)
-        ct_token = self.ff_ct_norm(ct_token + ct_ff)
+        ct_ff = self.ff_ct(ct_tokens)
+        ct_tokens = self.ff_ct_norm(ct_tokens + ct_ff)
 
         mem_ff = self.ff_mem(mem_tokens)
         mem_tokens = self.ff_mem_norm(mem_tokens + mem_ff)
 
         # 这里直接保持 float32 输出就行，外面 cls_out 也是 float32 计算
-        return ct_token, mem_tokens
+        return ct_tokens, mem_tokens
 
 
 class ResNet_MTL_nnUNet(ResidualEncoderUNet):
     """
     seg 分支：完全使用原版 ResidualEncoderUNet 的 encoder + UNetDecoder
     cls 分支：
-        - encoder 多尺度特征 global max pooling -> concat -> multi_scale_feat
-        - multi_scale_feat -> ct_token (1 token)
+        - 直接使用“原图强度”在两类 ROI 上的统计：
+          • 病灶 ROI（lesion），轻微膨胀
+          • 胰腺 ROI（film，经轻膨胀/可选闭运算）
+        - 分别对两路 ROI 做软加权平均（不再 Top‑K），得到两个向量
+        - 线性投影 -> 两个 ct tokens (t_les, t_pan)
         - 3 个记忆原型 token（每类 1 个）
-        - Dual-path Transformer 交互
-        - ct_token -> Linear 输出 3 类 logits
+        - Dual-path Transformer 双向交互（mem↔ct），query 维度 [B,2,D]
+        - 对两个 ct token 自适应加权聚合 -> 分类 logits
 
     task_mode:
       - 'seg_only' : 只训 seg（cls 分支 no_grad，不更新）
@@ -153,6 +162,7 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         task_mode: str = 'seg_only',
         cls_dropout: float = 0.3,
         lesion_channel_idx: int = 2,
+        pancreas_channel_idx: int = 1,
         cls_topk: float = 0.1
     ):
         super().__init__(
@@ -182,8 +192,9 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         self.task_mode = task_mode
         self.cls_num_classes = cls_num_classes
         self.num_classes = num_classes  # seg 类别数（含背景）
-        # 记录病灶通道索引，供 ROI 选择使用
+        # 记录病灶/胰腺通道索引，供 ROI 选择使用
         self.lesion_channel_idx = lesion_channel_idx
+        self.pancreas_channel_idx = pancreas_channel_idx
 
         # --- encoder 各 stage 通道数 ---
         if isinstance(features_per_stage, int):
@@ -193,37 +204,67 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         assert len(feat_list) == n_stages, "features_per_stage 长度必须等于 n_stages"
         self.encoder_feat_channels = feat_list
 
-        # 多尺度 pooled feature 总维度
+        # 多尺度 pooled feature 总维度（原 nnUNet encoder 通道总和）
         self.cls_feat_dim = sum(self.encoder_feat_channels)
 
-        # 将多尺度特征投到较小维度 d_model，当成一个 ct token
-        self.d_model = min(256, self.cls_feat_dim)  # 控制容量，避免 240 例过拟合太严重
-        self.ct_proj = nn.Linear(self.cls_feat_dim, self.d_model)
-        self.cls_topk = cls_topk  # 例如 0.1 表示 ROI 体素的前 10%
-        # 3 个类的记忆原型 token（3 分类）
-        # shape: [num_classes, d_model]
-        self.prototype_memory = nn.Parameter(
-            torch.randn(cls_num_classes, self.d_model) * 0.02
+        # Perceiver-style 分类分支超参
+        self.token_grid = (2, 2, 2)  # 每个 ROI 的 3D 网格划分
+        self.min_cell_occ = 0.01     # 网格占比门控阈值（避免近空格子噪声 token）
+        self.d_model = 128           # 统一投影维度 D，建议 128/192
+        self.num_latent = 16         # latent token 个数 L
+        self.num_heads = 4           # 注意力头数，需整除 D
+
+        # 原图 ROI -> D 的线性投影（两路：lesion / pancreas）
+        self.ct_proj_les = nn.Linear(input_channels, self.d_model)
+        self.ct_proj_ctx = nn.Linear(input_channels, self.d_model)
+
+        # 每个 encoder stage 单独的线性投影 C_s -> D（应用于网格 token）
+        self.enc_proj = nn.ModuleList([
+            nn.Linear(c, self.d_model) for c in self.encoder_feat_channels
+        ])
+
+        # 源/层/网格位置编码
+        # 0: enc_L, 1: enc_Ctx, 2: dec_L(预留), 3: dec_Ctx(预留), 4: raw_L, 5: raw_P
+        self.src_embed = nn.Embedding(6, self.d_model)
+        self.stage_embed_enc = nn.Embedding(len(self.encoder_feat_channels), self.d_model)
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(3, self.d_model), nn.GELU(), nn.Linear(self.d_model, self.d_model)
         )
-        # 默认启用 Top-K ROI 池化，并提高比例到 0.2（可被外部覆盖）
-        self.use_topk_pool = True
-        self.topk_ratio = 0.2
+        self.cls_topk = cls_topk  # 例如 0.1 表示 ROI 体素的前 10%
+        # 3 个类的记忆原型 token（可作为额外 memory tokens 附加进 Token Bank）
+        self.prototype_memory = nn.Parameter(torch.randn(cls_num_classes, self.d_model) * 0.02)
+        # 关闭 Top-K ROI 池化：改为原图 ROI 的加权平均，不再做 Top-K 选择
+        self.use_topk_pool = False
+        # 仍保留接口字段，但不再生效
+        self.topk_ratio_lesion = 0.0
+        self.topk_ratio_ctx = 0.0
         # 分类 ROI 轻微膨胀，默认开启（可被外部覆盖）
         self.cls_roi_dilate = True
+        # 胰腺 “film” ROI 的轻膨胀/闭运算参数
+        self.film_dilate_kernel = 3
+        self.film_dilate_iters = 1
+        # 使用闭运算（dilate->erode）的可微近似来生成平滑外膜，默认开启
+        self.film_use_closing = True
 
-        # 单层 Dual-path Transformer block
-        self.dual_block = DualPathTransformerBlock(
-            d_model=self.d_model,
-            num_heads=4,
-            ff_mult=2,
-            attn_dropout=0.1,
-            ffn_dropout=cls_dropout,
-        )
+        # 多层 Dual-path Transformer blocks（Perceiver-style：latent↔memory）
+        self.blocks = nn.ModuleList([
+            DualPathTransformerBlock(
+                d_model=self.d_model,
+                num_heads=self.num_heads,
+                ff_mult=2,
+                attn_dropout=0.1,
+                ffn_dropout=cls_dropout,
+            )
+            for _ in range(2)
+        ])
+        # latent tokens（[L, D]）
+        self.latent = nn.Parameter(torch.randn(self.num_latent, self.d_model) * 0.02)
 
         # 最后的分类头：直接用 ct_token 的表示做线性分类
         # self.cls_out = nn.Linear(self.d_model, cls_num_classes)
         # 归一化余弦分类器”（CosFace/ArcFace 风格）
         self.cls_out = NormedLinear(self.d_model, cls_num_classes, s=30.)
+        # 旧的 α 融合已不再使用；保留分类头为 NormedLinear
 
         # 初始化（卷积/线性等）
         InitWeights_He(1e-2)(self)
@@ -255,26 +296,43 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         if mode == 'seg_only':
             with torch.no_grad():
                 # seg_output 已经在 no_grad 上下文中
-                cls_output = self._forward_cls_branch(skips, seg_output, roi_mask)
+                cls_output = self._forward_cls_branch(x, skips, seg_output, roi_mask)
         elif mode == 'cls_only':
                 # 冻结 encoder 和 decoder 的特征
             skips_detached = [s.detach() for s in skips]
-            cls_output = self._forward_cls_branch(skips_detached, seg_output, roi_mask)
+            cls_output = self._forward_cls_branch(x, skips_detached, seg_output, roi_mask)
         else:  # both
             # 梯度流经 encoder, decoder, 和 cls_branch
-            cls_output = self._forward_cls_branch(skips, seg_output, roi_mask)
+            cls_output = self._forward_cls_branch(x, skips, seg_output, roi_mask)
 
         # 返回分割 logits 和分类 logits（分类为每病例 [B, C_cls]）
         return seg_output, cls_output
 
     # ---- 分类分支：多尺度 pooling + Dual-path Transformer + 记忆原型 ----
-    def _forward_cls_branch(self, skips, seg_output, roi_mask: torch.Tensor = None):
+    def _forward_cls_branch(self, x, skips, seg_output, roi_mask: torch.Tensor = None):
         if roi_mask is not None:
-            lesion_mask_hires = roi_mask.float().detach()
-            if lesion_mask_hires.ndim == 4:
-                lesion_mask_hires = lesion_mask_hires.unsqueeze(1)
-            elif lesion_mask_hires.ndim != 5:
-                raise RuntimeError(f"roi_mask must be 4D or 5D, got {lesion_mask_hires.ndim}")
+            roi_mask = roi_mask.float().detach()
+            if roi_mask.ndim == 4:
+                roi_mask = roi_mask.unsqueeze(1)  # B,1,D,H,W
+            elif roi_mask.ndim != 5:
+                raise RuntimeError(f"roi_mask must be 4D or 5D, got {roi_mask.ndim}")
+
+            # lesion from roi_mask[: ,0]
+            lesion_mask_hires = roi_mask[:, 0:1]
+            if getattr(self, 'cls_roi_dilate', False):
+                lesion_mask_hires = F.max_pool3d(lesion_mask_hires, kernel_size=3, stride=1, padding=1)
+
+            if roi_mask.shape[1] >= 2:
+                # 存在 GT 胰腺：对该通道做 3x3x3 轻膨胀即可
+                pancreas_mask_hires = roi_mask[:, 1:2]
+                pancreas_mask_hires = F.max_pool3d(pancreas_mask_hires, kernel_size=3, stride=1, padding=1)
+            else:
+                # 胰腺 ROI 来自网络分割概率并做闭运算（平滑外膜）
+                seg_logits_tmp = (seg_output[0] if isinstance(seg_output, (list, tuple)) else seg_output).float()
+                probs_tmp = F.softmax(seg_logits_tmp, dim=1)
+                p_idx = int(max(0, min(getattr(self, 'pancreas_channel_idx', 1), probs_tmp.shape[1] - 1)))
+                pancreas_mask_hires = probs_tmp[:, p_idx:p_idx + 1, ...].detach()
+                pancreas_mask_hires = self._make_film_roi(pancreas_mask_hires)
         else:
             seg_logits = (seg_output[0] if isinstance(seg_output, (list, tuple)) else seg_output).float()
             probs = F.softmax(seg_logits, dim=1)
@@ -284,62 +342,133 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
             lesion_mask_hires = probs[:, lesion_idx:lesion_idx + 1, ...].detach()
             if getattr(self, 'cls_roi_dilate', False):
                 lesion_mask_hires = F.max_pool3d(lesion_mask_hires, kernel_size=3, stride=1, padding=1)
+            # 胰腺 film ROI 来自 P 概率并轻膨胀/闭运算
+            pancreas_idx = int(max(0, min(getattr(self, 'pancreas_channel_idx', 1), probs.shape[1] - 1)))
+            pancreas_mask_hires = probs[:, pancreas_idx:pancreas_idx + 1, ...].detach()
+            pancreas_mask_hires = self._make_film_roi(pancreas_mask_hires)
 
-        device_type = skips[0].device.type
-        with torch.autocast(device_type=device_type, enabled=False):
-            pooled_feats = []
-            B = skips[0].shape[0]
+        # Perceiver-style：构建 Token Bank（enc L/ctx + 原图 L/P），latent 交互聚合
+        x_img = torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0)  # (B,C,D,H,W)
+        B = x_img.shape[0]
 
-            use_topk = getattr(self, 'use_topk_pool', True)
-            topk_ratio = getattr(self, 'topk_ratio', 0.1)
+        tokens_list = []  # [B, n_i, D]
 
-            for feat in skips:
-                feat = torch.nan_to_num(feat.float(), nan=0.0, posinf=0.0, neginf=0.0)
-                roi_resized = F.interpolate(
-                    torch.nan_to_num(lesion_mask_hires.float(), nan=0.0, posinf=0.0, neginf=0.0),
-                    size=feat.shape[2:], mode='trilinear', align_corners=False
-                )
+        # 1) Encoder stages: ROI 网格 token（L/Ctx），保符号 Masked-GeM
+        gD, gH, gW = self.token_grid
+        grid_z = torch.linspace(-1, 1, steps=gD, device=x_img.device)
+        grid_y = torch.linspace(-1, 1, steps=gH, device=x_img.device)
+        grid_x = torch.linspace(-1, 1, steps=gW, device=x_img.device)
+        gz, gy, gx = torch.meshgrid(grid_z, grid_y, grid_x, indexing='ij')
+        pos = torch.stack([gz, gy, gx], dim=-1).view(1, gD * gH * gW, 3)  # [1, n_cells, 3]
+        pos_emb = self.pos_mlp(pos)  # [1, n_cells, D]
 
-                # ROI 面积；阈值=16像素（过小则认为不可靠）
-                area = roi_resized.sum(dim=(2, 3, 4))
-                valid = (area > 16).squeeze(1)
+        for s, feat in enumerate(skips):
+            feat = torch.nan_to_num(feat.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            roi_L = F.interpolate(lesion_mask_hires, size=feat.shape[2:], mode='trilinear', align_corners=False)
+            roi_C = F.interpolate((pancreas_mask_hires * (1.0 - lesion_mask_hires)).clamp_min(0.0),
+                                   size=feat.shape[2:], mode='trilinear', align_corners=False)
 
-                # if use_topk and valid.any():
-                #     # 只在有效样本上做 top‑k，其他回退 GAP
-                #     tk_all = self.topk_pool(feat, roi_resized, k=topk_ratio)  # [B,C]
-                #     gap_all = feat.mean(dim=(2, 3, 4))                        # [B,C]
-                #     pooled = torch.where(valid.view(B, 1), tk_all, gap_all)
-                # else:
-                #     pooled = feat.mean(dim=(2, 3, 4))
-                
-                
-                # ROI 加权平均 + 自适应 Top‑K
-                eps = 1e-6
-                w = roi_resized / (roi_resized.sum(dim=(2,3,4), keepdim=True) + eps)
-                w_mean = (feat * w).sum(dim=(2,3,4))  # [B,C]
-                # 小 ROI（面积<16）回退到 Top‑K 或 GAP
-                if use_topk and valid.any():
-                    tk_all = self.topk_pool(feat, roi_resized, k=min(0.5, max(0.05, float(self.topk_ratio))))
-                    gap_all = feat.mean(dim=(2, 3, 4))
-                    pooled = torch.where(valid.view(B, 1), w_mean, gap_all) * 0.7 + \
-                                torch.where(valid.view(B, 1), tk_all, gap_all) * 0.3
-                else:
-                    pooled = w_mean
+            tL, occL = self.roi_grid_tokens(feat, roi_L, grid=self.token_grid, p=3.0)   # t: [B,n,Cs], occ: [B,n,1]
+            tC, occC = self.roi_grid_tokens(feat, roi_C, grid=self.token_grid, p=2.5)
 
-                pooled_feats.append(pooled)
+            tL = self.enc_proj[s](tL) + self.src_embed.weight[0].view(1, 1, -1) + self.stage_embed_enc.weight[s].view(1, 1, -1) + pos_emb
+            tC = self.enc_proj[s](tC) + self.src_embed.weight[1].view(1, 1, -1) + self.stage_embed_enc.weight[s].view(1, 1, -1) + pos_emb
+            # 软门控：近空格子（ROI 占比过低）置零，避免噪声 token 分散注意力
+            thr = float(getattr(self, 'min_cell_occ', 0.01))
+            gateL = (occL >= thr).to(dtype=tL.dtype)
+            gateC = (occC >= thr).to(dtype=tC.dtype)
+            tL = tL * gateL
+            tC = tC * gateC
+            tokens_list += [tL, tC]
 
-            multi_scale_feat = torch.cat(pooled_feats, dim=1)  # (B, sum(C_i))
-            ct_token = self.ct_proj(multi_scale_feat).unsqueeze(1)       # (B,1,D)
-            mem_tokens = self.prototype_memory.unsqueeze(0).expand(ct_token.size(0), -1, -1).float()
+        # 2) 原图 ROI 全局 tokens（保符号 Masked-GeM）
+        raw_L = self.masked_gem_signed(x_img, lesion_mask_hires, p=3.0)    # [B,C_in]
+        raw_P = self.masked_gem_signed(x_img, pancreas_mask_hires, p=2.0)  # [B,C_in]
+        raw_L = self.ct_proj_les(raw_L).unsqueeze(1) + self.src_embed.weight[4].view(1, 1, -1)
+        raw_P = self.ct_proj_ctx(raw_P).unsqueeze(1) + self.src_embed.weight[5].view(1, 1, -1)
+        tokens_list += [raw_L, raw_P]
 
-            ct_token, mem_tokens = self.dual_block(ct_token, mem_tokens)
-            cls_logits = self.cls_out(ct_token.squeeze(1))
+        # 3) 拼接 Token Bank（memory tokens）
+        mem_tokens = torch.cat(tokens_list, dim=1)  # [B, N, D]
+
+        # 可选：附加 prototype 作为额外 memory tokens
+        proto = F.normalize(self.prototype_memory.float(), dim=-1).unsqueeze(0).expand(B, -1, -1)
+        mem_tokens = torch.cat([mem_tokens, proto], dim=1)
+
+        # 4) latent tokens（ct tokens），多层 cross-attn 聚合
+        ct_tokens = self.latent.unsqueeze(0).expand(B, -1, -1).float()  # [B, L, D]
+        for blk in self.blocks:
+            ct_tokens, mem_tokens = blk(ct_tokens, mem_tokens)
+
+        # 5) 分类：平均聚合 latent
+        ct_agg = ct_tokens.mean(dim=1)
+        cls_logits = self.cls_out(ct_agg)
 
         return cls_logits.float()
 
+    def _make_film_roi(self, p_mask: torch.Tensor) -> torch.Tensor:
+        """根据胰腺概率图生成 soft 'film' ROI。
+        - 轻膨胀：max_pool3d kernel=film_dilate_kernel, iters=film_dilate_iters
+        - 可选闭运算：dilate->erode（对 soft map 采用 max_pool 与其对偶实现）
+        """
+        k = int(getattr(self, 'film_dilate_kernel', 3))
+        iters = int(getattr(self, 'film_dilate_iters', 1))
+        use_closing = bool(getattr(self, 'film_use_closing', False))
+        if k < 1:
+            return p_mask
+        pad = k // 2
+        out = p_mask
+        for _ in range(max(1, iters)):
+            out = F.max_pool3d(out, kernel_size=k, stride=1, padding=pad)
+        if use_closing:
+            # erosion 近似：对 -x 做 max_pool 即 min_pool
+            tmp = out
+            for _ in range(max(1, iters)):
+                tmp = -F.max_pool3d(-tmp, kernel_size=k, stride=1, padding=pad)
+            out = tmp
+        return out
 
     @staticmethod
-    def topk_pool(feats: torch.Tensor, mask: torch.Tensor, k: float = 0.1) -> torch.Tensor:
+    def _binarize_soft_mask(m: torch.Tensor, thr: float = 0.2) -> torch.Tensor:
+        return (m >= float(thr)).to(dtype=m.dtype)
+
+
+    @staticmethod
+    def masked_gem_signed(x: torch.Tensor, m: torch.Tensor, p: float = 3.0, eps: float = 1e-6) -> torch.Tensor:
+        """
+        保符号 Masked-GeM：对未 ReLU 的特征更稳。
+        x: [B,C,D,H,W], m: [B,1,D,H,W]
+        返回: [B,C]
+        """
+        B, C = x.shape[:2]
+        x = x.view(B, C, -1).float()
+        m = m.view(B, 1, -1).float()
+        p_ = torch.as_tensor(p, dtype=x.dtype, device=x.device).view(1, 1, 1)
+        w = (m * (x.abs() + eps).pow(p_ - 1)).clamp_min(eps)  # (B,1,N) 广播到 (B,C,N)
+        num = (w * x).sum(-1)                                  # (B,C)
+        den = w.sum(-1).clamp_min(eps)                         # (B,1)
+        return num / den
+
+    def roi_grid_tokens(self, feat: torch.Tensor, roi: torch.Tensor, grid=(2, 2, 2), p: float = 3.0, eps: float = 1e-6):
+        """
+        基于 ROI 的保符号 Masked-GeM + 3D 网格划分，生成多个 token，并返回每格 ROI 占比用于门控。
+        feat: [B,C,D,H,W], roi: [B,1,D,H,W]
+        返回: out: [B, n_cells, C], occ: [B, n_cells, 1]（∈[0,1]）
+        """
+        B, C = feat.shape[:2]
+        gD, gH, gW = grid
+        x = feat.float()
+        m = roi.float()
+        w = (x.abs() + eps).pow(p - 1) * m                      # [B,C,D,H,W]
+        num = F.adaptive_avg_pool3d(w * x, output_size=(gD, gH, gW))  # [B,C,gD,gH,gW]
+        den = F.adaptive_avg_pool3d(w,     output_size=(gD, gH, gW)).clamp_min(eps)
+        out = (num / den).view(B, C, -1).transpose(1, 2)        # [B, n_cells, C]
+        # 每格 ROI 占比（范围 0-1）
+        occ = F.adaptive_avg_pool3d(m, output_size=(gD, gH, gW)).view(B, -1, 1)
+        return out, occ
+
+    @staticmethod
+    def topk_pool(feats: torch.Tensor, mask: torch.Tensor, k: float = 0.1, bin_mask: torch.Tensor = None) -> torch.Tensor:
         """
         feats: [B,C,D,H,W]；mask: [B,1,D,H,W]，元素∈[0,1]
         k∈(0,1] 表示取 ROI 体素数的 k 比例；k>=1 表示固定取前 k 个。
@@ -350,10 +479,11 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         B, C = x.shape[:2]
         x = x.view(B, C, -1)              # (B,C,N)
         m = mask.view(B, 1, -1)           # (B,1,N)
+        mb = bin_mask.view(B, 1, -1) if bin_mask is not None else m
 
         # 计算每个样本的 k
         if isinstance(k, float) and k <= 1.0:
-            k_each = torch.clamp((m.sum(-1) * k).long(), min=1)  # (B,1)
+            k_each = torch.clamp((mb.sum(-1) * k).long(), min=1)  # (B,1)
         else:
             k_each = torch.full((B, 1), int(k), dtype=torch.long, device=x.device)
 
@@ -367,4 +497,3 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
             kb = int(k_each[b].item())
             out.append(vals[b, :, :kb].mean(-1))
         return torch.stack(out, 0)  # (B,C)
-

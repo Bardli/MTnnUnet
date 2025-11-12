@@ -123,6 +123,27 @@ class nnUNetTrainer(object):
                 self.device = torch.device(type='cuda', index=0)
             print(f"Using device: {self.device}")
 
+        # --- Global backend & AMP/SDPA preferences ---
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision('high')
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+        # SDPA/FlashAttention toggles (PyTorch >= 2.0)
+        try:
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(False)
+        except Exception:
+            pass
+        # Preferred AMP dtype: BF16 if supported, else FP16
+        try:
+            self.amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        except Exception:
+            self.amp_dtype = torch.float16
+
         # loading and saving this class for continuing from checkpoint should not happen based on pickling. This
         # would also pickle the network etc. Bad, bad. Instead we just reinstantiate and then load the checkpoint we
         # need. So let's save the init args
@@ -167,7 +188,7 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250 
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 200
+        self.num_epochs = 500
         self.current_epoch = 0
         self.enable_deep_supervision = True
         # ('both', 'seg_only', 'cls_only')
@@ -214,7 +235,9 @@ class nnUNetTrainer(object):
         self.num_input_channels = None  # -> self.initialize()
         self.network = None  # -> self.build_network_architecture()
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
-        self.grad_scaler = GradScaler("cuda") if self.device.type == 'cuda' else None
+        # GradScaler only needed for FP16; BF16 uses wide exponent and does not require scaling
+        _use_fp16 = (self.device.type == 'cuda' and self.amp_dtype == torch.float16)
+        self.grad_scaler = GradScaler("cuda", enabled=_use_fp16) if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
         ### Simple logging. Don't take that away from me!
         # initialize log file. This is just our log for the print statements etc. Not to be confused with lightning
@@ -1603,7 +1626,7 @@ class nnUNetTrainer(object):
         self.optimizer.zero_grad(set_to_none=True)
         mode = self.task_mode
 
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with autocast(self.device.type, dtype=self.amp_dtype) if self.device.type == 'cuda' else dummy_context():
             # 网络返回 (seg_output, cls_output)
             # task_mode 的具体梯度逻辑在模型内部处理
             roi_mask_for_cls = None
@@ -1655,16 +1678,15 @@ class nnUNetTrainer(object):
                 self.lambda_seg, self.lambda_cls = 0.0, 1.0
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
                 logits = output_cls.float()
-                with torch.autocast(device_type=self.device.type, enabled=False):
-                    l_cls = self.cls_loss(logits, target_cls)
+                # 在 AMP(BF16/FP16) 下直接计算分类损失，BF16 足够稳定
+                l_cls = self.cls_loss(logits, target_cls)
                 l = l_cls
 
             else:  # mode == 'both'
                 # seg + cls 一起训：Softmax 约束权重
                 l_seg = self.seg_loss(output_seg, target_seg)
                 logits = output_cls.float()
-                with torch.autocast(device_type=self.device.type, enabled=False):
-                    l_cls = self.cls_loss(logits, target_cls)
+                l_cls = self.cls_loss(logits, target_cls)
                 w = torch.softmax(self.task_logits, dim=0)
                 # 加性平滑护栏：保证每个任务权重 >= floor，且总和为 1
                 _k = w.shape[0]
@@ -1690,10 +1712,11 @@ class nnUNetTrainer(object):
             # EMA 更新
             self._update_ema()
 
+        # 返回 GPU 张量，避免每步 CPU 同步；在 epoch 末再做汇总与同步
         return {
-            'loss': l.detach().cpu().numpy(),
-            'loss_seg': l_seg.detach().cpu().numpy(),
-            'loss_cls': l_cls.detach().cpu().numpy()
+            'loss': l.detach(),
+            'loss_seg': l_seg.detach(),
+            'loss_cls': l_cls.detach()
         }
 
 
@@ -1705,22 +1728,35 @@ class nnUNetTrainer(object):
         if self.is_ddp:
             losses_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(losses_tr, outputs['loss'])
-            loss_here = np.vstack(losses_tr).mean()
-            
+            if torch.is_tensor(losses_tr[0]):
+                loss_here = torch.stack(losses_tr).float().mean().item()
+            else:
+                loss_here = np.vstack(losses_tr).mean()
+
             # --- GAI: 收集 seg 和 cls 训练损失 ---
             losses_seg_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(losses_seg_tr, outputs['loss_seg'])
-            loss_seg_here = np.vstack(losses_seg_tr).mean()
+            if torch.is_tensor(losses_seg_tr[0]):
+                loss_seg_here = torch.stack(losses_seg_tr).float().mean().item()
+            else:
+                loss_seg_here = np.vstack(losses_seg_tr).mean()
 
             losses_cls_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(losses_cls_tr, outputs['loss_cls'])
-            loss_cls_here = np.vstack(losses_cls_tr).mean()
+            if torch.is_tensor(losses_cls_tr[0]):
+                loss_cls_here = torch.stack(losses_cls_tr).float().mean().item()
+            else:
+                loss_cls_here = np.vstack(losses_cls_tr).mean()
             # --- GAI END ---
         else:
-            loss_here = np.mean(outputs['loss'])
-            # --- GAI: 收集 seg 和 cls 训练损失 ---
-            loss_seg_here = np.mean(outputs['loss_seg'])
-            loss_cls_here = np.mean(outputs['loss_cls'])
+            if torch.is_tensor(outputs['loss']):
+                loss_here = outputs['loss'].float().mean().item()
+                loss_seg_here = outputs['loss_seg'].float().mean().item()
+                loss_cls_here = outputs['loss_cls'].float().mean().item()
+            else:
+                loss_here = np.mean(outputs['loss'])
+                loss_seg_here = np.mean(outputs['loss_seg'])
+                loss_cls_here = np.mean(outputs['loss_cls'])
             # --- GAI END ---
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
@@ -1783,7 +1819,7 @@ class nnUNetTrainer(object):
             else:
                 target_seg = target_seg.to(self.device, non_blocking=True)
 
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with autocast(self.device.type, dtype=self.amp_dtype) if self.device.type == 'cuda' else dummy_context():
             # 使用 EMA 模型进行验证（若可用）
             net = self.ema_model if getattr(self, 'ema_model', None) is not None else self.network
 
@@ -1818,16 +1854,14 @@ class nnUNetTrainer(object):
             if mode == 'cls_only':
                 l_seg = torch.zeros(1, device=self.device, dtype=torch.float32)
                 logits_val = output_cls.float()
-                with torch.autocast(device_type=self.device.type, enabled=False):
-                    l_cls = self.cls_loss(logits_val, target_cls)
+                l_cls = self.cls_loss(logits_val, target_cls)
                 l = l_cls
             else:
                 # seg_only 或 both
                 # removed debug stats
                 l_seg = self.seg_loss(output_seg, target_seg)
                 logits_val = output_cls.float()
-                with torch.autocast(device_type=self.device.type, enabled=False):
-                    l_cls = self.cls_loss(logits_val, target_cls)
+                l_cls = self.cls_loss(logits_val, target_cls)
                 if mode == 'seg_only':
                     l = l_seg
                 else:  # both
