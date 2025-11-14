@@ -2603,6 +2603,8 @@ class nnUNetTrainer(object):
 # nnUNetv2_plan_and_preprocess -d 002 -pl nnUNetPlannerResEncM
 # train
 # nnUNetv2_train 002 3d_fullres 4 -p nnUNetResEncUNetMPlans 
+# train using all data 
+# nnUNetv2_train 002 3d_fullres 5 -p nnUNetResEncUNetMPlans
 # train cls
 # nnUNetv2_train 002 3d_fullres 5 -p nnUNetResEncUNetMPlans -pretrained_weights F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\bestsig\20251107_best3.pth
 

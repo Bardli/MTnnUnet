@@ -1,3 +1,4 @@
+from matplotlib.pyplot import grid
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -94,16 +95,16 @@ class DualPathTransformerBlock(nn.Module):
         except Exception:
             attn_dtype = orig_dtype
 
-        ct_norm = self.norm_ct1(ct_tokens).to(attn_dtype)
-        mem_norm = self.norm_mem1(mem_tokens).to(attn_dtype)
+        ct_norm = self.norm_ct1(ct_tokens)
+        mem_norm = self.norm_mem1(mem_tokens)
         ct_updated, _ = self.attn_ct_from_mem(query=ct_norm, key=mem_norm, value=mem_norm, need_weights=False)
-        ct_tokens = ct_res + ct_updated.to(orig_dtype)
+        ct_tokens = ct_res + ct_updated
 
         # ----- 路径2: mem <- ct -----
-        ct_norm2 = self.norm_ct2(ct_tokens).to(attn_dtype)
-        mem_norm2 = self.norm_mem2(mem_tokens).to(attn_dtype)
+        ct_norm2 = self.norm_ct2(ct_tokens)
+        mem_norm2 = self.norm_mem2(mem_tokens)
         mem_updated, _ = self.attn_mem_from_ct(query=mem_norm2, key=ct_norm2, value=ct_norm2, need_weights=False)
-        mem_tokens = mem_res + mem_updated.to(orig_dtype)
+        mem_tokens = mem_res + mem_updated
 
         # ----- FFN + 残差 -----
         ct_ff = self.ff_ct(ct_tokens)
@@ -271,6 +272,16 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         init_last_bn_before_add_to_0(self)
         # 原型在上面已经手动 normal 初始化了，不会被 He 覆盖
 
+
+        # __init__ 末尾：
+        self.register_buffer('pos_coords', self._make_pos_coords(self.token_grid), persistent=False)
+    def _make_pos_coords(self, grid):
+        gD, gH, gW = grid
+        z = torch.linspace(-1, 1, gD)
+        y = torch.linspace(-1, 1, gH)
+        x = torch.linspace(-1, 1, gW)
+        gz, gy, gx = torch.meshgrid(z, y, x, indexing='ij')
+        return torch.stack([gz, gy, gx], dim=-1).view(1, gD * gH * gW, 3)  # [1, n_cells, 3]
     # 方便外部切换模式
     def set_task_mode(self, mode: str):
         assert mode in ('seg_only', 'both', 'cls_only')
@@ -354,13 +365,14 @@ class ResNet_MTL_nnUNet(ResidualEncoderUNet):
         tokens_list = []  # [B, n_i, D]
 
         # 1) Encoder stages: ROI 网格 token（L/Ctx），保符号 Masked-GeM
-        gD, gH, gW = self.token_grid
-        grid_z = torch.linspace(-1, 1, steps=gD, device=x_img.device)
-        grid_y = torch.linspace(-1, 1, steps=gH, device=x_img.device)
-        grid_x = torch.linspace(-1, 1, steps=gW, device=x_img.device)
-        gz, gy, gx = torch.meshgrid(grid_z, grid_y, grid_x, indexing='ij')
-        pos = torch.stack([gz, gy, gx], dim=-1).view(1, gD * gH * gW, 3)  # [1, n_cells, 3]
-        pos_emb = self.pos_mlp(pos)  # [1, n_cells, D]
+        # gD, gH, gW = self.token_grid
+        # grid_z = torch.linspace(-1, 1, steps=gD, device=x_img.device)
+        # grid_y = torch.linspace(-1, 1, steps=gH, device=x_img.device)
+        # grid_x = torch.linspace(-1, 1, steps=gW, device=x_img.device)
+        # gz, gy, gx = torch.meshgrid(grid_z, grid_y, grid_x, indexing='ij')
+        # pos = torch.stack([gz, gy, gx], dim=-1).view(1, gD * gH * gW, 3)  # [1, n_cells, 3]
+        # pos_emb = self.pos_mlp(pos)  # [1, n_cells, D]
+        pos_emb = self.pos_mlp(self.pos_coords)  # [1, n_cells, D]
 
         for s, feat in enumerate(skips):
             feat = torch.nan_to_num(feat.float(), nan=0.0, posinf=0.0, neginf=0.0)
