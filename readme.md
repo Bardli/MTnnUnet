@@ -77,7 +77,7 @@ data
 ```
 
 
----
+
 
 ## Preprocessing
 
@@ -90,7 +90,7 @@ Typical steps:
 * **Resampling**: as defined in `plans.json` (handled automatically).
 
 
----
+
 
 ## Training
 
@@ -202,7 +202,7 @@ Compute **macro‑F1** for **subtype classification**.
 
 | Model                   | Whole‑Pancreas Dice ↑ | Lesion Dice ↑ | Macro‑F1 (Subtype) ↑ |
 | ----------------------- | --------------------: | ------------: | -------------------: | 
-| Our multi‑task nnUNetv2 |                     – |             – |                    – |
+| Our multi‑task nnUNetv2 |       0.9126 ± 0.0560 |0.6293 ± 0.2883| 0.8580641805793935   |
 
 
 

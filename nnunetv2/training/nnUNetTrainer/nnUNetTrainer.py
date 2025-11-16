@@ -2611,6 +2611,7 @@ class nnUNetTrainer(object):
 # predict
 # nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 4 -chk  checkpoint_best_macro_f1.pth
 # nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 4 -chk  checkpoint_best.pth
+# nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\img -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\validation\prediction -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 5 -chk  checkpoint_best.pth -step_size 0.8
 # submission
 # nnUNetv2_predict -i F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\test -o F:\Programming\JupyterWorkDir\labquiz\ML-Quiz-3DMedImg\Baidu_Li_Results -d 002 -c 3d_fullres -p nnUNetResEncUNetMPlans -f 4 -chk  checkpoint_best_macro_f1.pth
 
