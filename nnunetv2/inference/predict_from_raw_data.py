@@ -5,7 +5,7 @@ import os
 from copy import deepcopy
 from queue import Queue
 from threading import Thread
-from time import sleep
+from time import sleep, time
 from typing import Tuple, Union, List, Optional
 
 import numpy as np
@@ -374,6 +374,8 @@ class nnUNetPredictor(object):
         subtype_csv_rows = []
         # --- GAI 结束 ---
         
+        start_time = time()
+
         with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
             worker_list = [i for i in export_pool._pool]
             r = []
@@ -493,6 +495,9 @@ class nnUNetPredictor(object):
                     writer.writerow(r)
         # --- GAI 结束 ---
 
+        total_time = time() - start_time
+        print(f"Total inference time (all cases, multiprocessing): {total_time:.2f} seconds")
+
         # clear lru cache
         compute_gaussian.cache_clear()
         # clear device cache
@@ -557,42 +562,46 @@ class nnUNetPredictor(object):
         """
         n_threads = torch.get_num_threads()
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
-        prediction = None
-        # --- GAI: 为 seg 和 cls 创建累加器 ---
-        prediction_seg = None
-        prediction_cls = None
-        # --- GAI 结束 ---
 
-        for params in self.list_of_parameters:
-            # ... (加载 network state_dict) ...
-            if not isinstance(self.network, OptimizedModule):
-                self.network.load_state_dict(params)
-            else:
-                self.network._orig_mod.load_state_dict(params)
+        # ------- 情况 1：单折或者没有 parameters，直接用当前 self.network -------
+        if not self.list_of_parameters or len(self.list_of_parameters) == 1:
+            # initialize_from_trained_model_folder 里已经 load 过一次 parameters[0]
+            # manual_initialization 的场景下，trainer 也已经把权重放进 self.network 了
+            prediction_seg, prediction_cls = self.predict_sliding_window_return_logits(data)
+            prediction_seg = prediction_seg.to('cpu')
+            prediction_cls = prediction_cls.to('cpu')
 
-            if prediction_seg is None:
-                # --- GAI: 获取 (seg, cls) 元组 ---
-                prediction_seg, prediction_cls = self.predict_sliding_window_return_logits(data)
-                prediction_seg = prediction_seg.to('cpu')
-                prediction_cls = prediction_cls.to('cpu')
-                # --- GAI 结束 ---
-            else:
-                # --- GAI: 累加 (seg, cls) 元组 ---
-                next_pred_seg, next_pred_cls = self.predict_sliding_window_return_logits(data)
-                prediction_seg += next_pred_seg.to('cpu')
-                prediction_cls += next_pred_cls.to('cpu')
-                # --- GAI 结束 ---
+        # ------- 情况 2：真多折 ensemble，保留原有逻辑 -------
+        else:
+            prediction_seg = None
+            prediction_cls = None
 
-        if len(self.list_of_parameters) > 1:
-            # --- GAI: 平均 (seg, cls) 元组 ---
+            for params in self.list_of_parameters:
+                # 这里只在需要 ensemble 的时候才切换权重
+                if not isinstance(self.network, OptimizedModule):
+                    self.network.load_state_dict(params)
+                else:
+                    self.network._orig_mod.load_state_dict(params)
+
+                seg, cls = self.predict_sliding_window_return_logits(data)
+                seg = seg.to('cpu')
+                cls = cls.to('cpu')
+
+                if prediction_seg is None:
+                    prediction_seg, prediction_cls = seg, cls
+                else:
+                    prediction_seg += seg
+                    prediction_cls += cls
+
+            # 多折平均
             prediction_seg /= len(self.list_of_parameters)
             prediction_cls /= len(self.list_of_parameters)
-            # --- GAI 结束 ---
 
-        if self.verbose: print('Prediction done')
+        if self.verbose:
+            print('Prediction done')
+
         torch.set_num_threads(n_threads)
-        
-        return prediction_seg, prediction_cls # GAI: 返回元组
+        return prediction_seg, prediction_cls
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
         slicers = []
@@ -1220,12 +1229,21 @@ def predict_entry_point_modelfolder():
                                 allow_tqdm=not args.disable_progress_bar,
                                 verbose_preprocessing=args.verbose)
     predictor.initialize_from_trained_model_folder(args.m, args.f, args.chk)
+
+    # 记录推理开始时间（不包含模型加载）
+    # start_time = time()
+
     predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
                                  overwrite=not args.continue_prediction,
                                  num_processes_preprocessing=args.npp,
                                  num_processes_segmentation_export=args.nps,
                                  folder_with_segs_from_prev_stage=args.prev_stage_predictions,
                                  num_parts=1, part_id=0)
+
+    # 打印总推理时间（包括预处理、网络前向与结果导出）
+    total_time = time() - start_time
+    # total_time = time() - start_time
+    # print(f"Total inference time: {total_time:.2f} seconds")
 
 
 def predict_entry_point():
@@ -1338,11 +1356,14 @@ def predict_entry_point():
         args.f,
         checkpoint_name=args.chk
     )
-    
+
+    # 记录推理开始时间（不包含模型加载）
+    start_time = time()
+
     run_sequential = args.nps == 0 and args.npp == 0
     
     if run_sequential:
-        
+
         print("Running in non-multiprocessing mode")
         predictor.predict_from_files_sequential(args.i, args.o, save_probabilities=args.save_probabilities,
                                                 overwrite=not args.continue_prediction,
@@ -1357,6 +1378,11 @@ def predict_entry_point():
                                     folder_with_segs_from_prev_stage=args.prev_stage_predictions,
                                     num_parts=args.num_parts,
                                     part_id=args.part_id)
+
+    # 打印总推理时间（包括预处理、网络前向与结果导出）
+    total_time = time() - start_time
+    total_time = time() - start_time
+    print(f"Total inference time: {total_time:.2f} seconds")
     
     # r = predict_from_raw_data(args.i,
     #                           args.o,

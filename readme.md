@@ -109,14 +109,14 @@ export nnUNet_results=/path/to/nnUNet_results
 # Suppose your dataset id is 999 and name is Dataset999_PancreasQuiz
 # Prepare JSONs & copy NIfTI into the nnUNetv2 directory layout before this step.
 
-nnUNetv2_plan_and_preprocess -d 999 -c 3d_fullres -pl nnUNetPlans -np 8
+nnUNetv2_plan_and_preprocess -d 002 -c 3d_fullres -pl nnUNetResEncUNetMPlans -np 8
 ```
 
 ### 2) Train (fold 0 as example)
 
 ```bash
 # base trainer name stays "nnUNetTrainer" unless you created a custom subclass
-nnUNetv2_train 999 3d_fullres nnUNetTrainer 0 -p nnUNetPlans
+nnUNetv2_train 002 3d_fullres nnUNetTrainer 5 -p nnUNetResEncUNetMPlans
 ```
 
 **Tracking & reporting:** the assignment asks you to **log training/validation curves and metrics for both segmentation and classification via Weights & Biases (wandb)**—please enable `wandb` in your trainer or scripts. 
@@ -133,33 +133,10 @@ We provide two CLI entry points compatible with nnUNetv2:
 
 ### A) Predict **by dataset id** (preferred)
 
-```bash
-nnUNetv2_predict \
-  -i /path/to/test/images \
-  -o /path/to/preds \
-  -d 999 \
-  -p nnUNetPlans \
-  -tr nnUNetTrainer \
-  -c 3d_fullres \
-  -f 0 1 2 3 4 \
-  -step_size 0.5 \
-  -device cuda \
-  -npp 3 -nps 3
-# add --disable_tta to turn off mirror TTA
-```
-
-### B) Predict **from a model folder**
 
 ```bash
-nnUNetv2_predict_from_modelfolder \
-  -i /path/to/test/images \
-  -o /path/to/preds \
-  -m /path/to/nnUNet_results/.../fold_* \
-  -f 0 1 2 3 4 \
-  -chk checkpoint_final.pth \
-  -device cuda
+nnUNetv2_predict -i INPUT_FILE -o OUT_FILE -d DATA_ID -c 3d_fullres -p nnUNetResEncUNetMPlans -f 5 -chk  checkpoint_best_macro_f1.pth
 ```
-
 **Outputs produced:**
 
 * Segmentation NIfTI for each case (same basename as input).
@@ -174,7 +151,7 @@ nnUNetv2_predict_from_modelfolder \
   quiz_047.nii.gz,2
   ```
 
-  (CSV formatting and columns are required as specified on *page 3*.) 
+
 
 **What the code does differently at inference (high‑level):**
 
