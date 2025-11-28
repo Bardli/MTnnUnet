@@ -109,7 +109,7 @@ export nnUNet_results=/path/to/nnUNet_results
 # Suppose your dataset id is 999 and name is Dataset999_PancreasQuiz
 # Prepare JSONs & copy NIfTI into the nnUNetv2 directory layout before this step.
 
-nnUNetv2_plan_and_preprocess -d 002 -c 3d_fullres -pl nnUNetResEncUNetMPlans -np 8
+nnUNetv2_plan_and_preprocess -d 002 -c 3d_fullres -pl nnUNetPlannerResEncM
 ```
 
 ### 2) Train (fold 0 as example)
